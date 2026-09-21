@@ -1,0 +1,1120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AEC Data Model chat</title>
+<!--
+  AEC Data Model chat: a static, browser-only take on aps-aecdm-mcp-dotnet.
+
+  Setup
+  1. In your APS app (type: Single Page Application), add this page's URL as a callback,
+     e.g. http://localhost:8080/  (the exact URL is shown in Settings).
+  2. Serve this folder:  python -m http.server 8080   then open http://localhost:8080/
+  3. Open Settings, add your APS client ID and an Anthropic API key, then sign in to Autodesk.
+
+  The Anthropic key lives in sessionStorage for this tab only. The client ID, region and
+  model choice live in localStorage. Nothing is sent anywhere except Autodesk and Anthropic.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css">
+<script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
+<style>
+:root {
+  --paper: #EDEFEB;
+  --sheet: #F9FAF7;
+  --ink: #22272B;
+  --ink-2: #5A6167;
+  --rule: #C8CDC5;
+  --trace: #F2E49B;
+  --trace-ink: #4A4015;
+  --trace-rule: #D9C766;
+  --pencil: #1E5CA6;
+  --pencil-ink: #FFFFFF;
+  --danger: #A8322B;
+  --sans: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #181B1E;
+    --sheet: #202428;
+    --ink: #E3E6E0;
+    --ink-2: #9AA1A6;
+    --rule: #363C41;
+    --trace: #38331B;
+    --trace-ink: #EDE0A0;
+    --trace-rule: #5E5528;
+    --pencil: #86B4EC;
+    --pencil-ink: #0E1A2A;
+    --danger: #F08C84;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 15px/1.5 var(--sans);
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--pencil); outline-offset: 2px; }
+
+/* Top bar */
+.bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--sheet);
+}
+.bar h1 {
+  margin: 0 auto 0 0;
+  font-size: 18px; font-weight: 650; font-stretch: 82%; letter-spacing: 0.01em;
+}
+.status { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--rule); }
+.dot.on { background: #3E8E5A; }
+.btn {
+  border: 1px solid var(--rule); background: transparent;
+  padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 14px;
+}
+.btn:hover { border-color: var(--ink-2); }
+.btn.primary { background: var(--pencil); border-color: var(--pencil); color: var(--pencil-ink); font-weight: 550; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Main split */
+main {
+  display: grid;
+  grid-template-columns: minmax(360px, 460px) 1fr;
+  min-height: 0;
+}
+.chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; border-right: 1px solid var(--rule); background: var(--sheet); }
+.log { overflow-y: auto; padding: 18px 18px 8px; }
+.viewer-wrap { position: relative; min-height: 0; }
+#apsViewer { position: absolute; inset: 0; }
+.viewer-empty {
+  position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+  color: var(--ink-2); padding: 24px; pointer-events: none;
+  background-image:
+    linear-gradient(var(--rule) 1px, transparent 1px),
+    linear-gradient(90deg, var(--rule) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: -1px -1px;
+}
+.viewer-empty p { background: var(--paper); padding: 10px 14px; margin: 0; max-width: 34ch; }
+
+/* Messages */
+.msg { margin: 0 0 16px; max-width: 70ch; }
+.msg.user {
+  margin-left: auto; width: fit-content; max-width: 90%;
+  background: var(--paper); border: 1px solid var(--rule);
+  padding: 8px 12px; border-radius: 6px; white-space: pre-wrap;
+}
+.msg.assistant p { margin: 0 0 10px; }
+.msg.assistant ul, .msg.assistant ol { margin: 0 0 10px; padding-left: 20px; }
+.msg.assistant h4 { margin: 14px 0 6px; font-size: 15px; font-weight: 650; }
+.msg code { font: 13px/1.4 var(--mono); background: var(--paper); padding: 1px 4px; border-radius: 3px; word-break: break-all; }
+.msg pre { background: var(--paper); padding: 10px; overflow-x: auto; border-radius: 4px; }
+.msg pre code { background: none; padding: 0; word-break: normal; }
+.tablewrap { overflow-x: auto; margin: 0 0 10px; }
+.msg table { border-collapse: collapse; font-size: 13.5px; }
+.msg th, .msg td { border-bottom: 1px solid var(--rule); padding: 4px 10px 4px 0; text-align: left; vertical-align: top; }
+.msg th { font-weight: 600; }
+.usage { font-size: 12px; color: var(--ink-2); margin: -8px 0 14px; }
+.error { color: var(--danger); border-left: 3px solid var(--danger); padding: 4px 10px; margin: 0 0 16px; }
+
+/* Tool slips: the yellow trace */
+.slip {
+  background: var(--trace); color: var(--trace-ink);
+  border: 1px solid var(--trace-rule);
+  border-radius: 2px;
+  margin: 0 0 10px; font-size: 13.5px;
+  box-shadow: 2px 2px 0 var(--trace-rule);
+}
+.slip summary { cursor: pointer; padding: 6px 10px; list-style: none; display: flex; gap: 8px; align-items: baseline; }
+.slip summary::-webkit-details-marker { display: none; }
+.slip .name { font-weight: 650; font-stretch: 85%; }
+.slip .note { opacity: 0.85; }
+.slip.running .note::after { content: "…"; }
+.slip.failed { border-color: var(--danger); box-shadow: 2px 2px 0 var(--danger); }
+.slip pre {
+  margin: 0; padding: 8px 10px; border-top: 1px dashed var(--trace-rule);
+  font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word;
+  max-height: 260px; overflow: auto;
+}
+
+/* Empty chat */
+.starter { color: var(--ink-2); }
+.starter h2 { font-size: 22px; font-weight: 600; font-stretch: 82%; color: var(--ink); margin: 8px 0 6px; }
+.starter p { margin: 0 0 14px; max-width: 46ch; }
+.starter button {
+  display: block; width: 100%; text-align: left; margin: 0 0 8px;
+  background: var(--paper); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 8px 12px; cursor: pointer;
+}
+.starter button:hover { border-color: var(--ink-2); }
+
+/* Composer */
+.composer { border-top: 1px solid var(--rule); padding: 10px 12px 12px; }
+.composer .row { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea {
+  flex: 1; resize: none; min-height: 42px; max-height: 180px;
+  padding: 9px 10px; border: 1px solid var(--rule); border-radius: 4px; background: var(--paper);
+}
+.sets { font-size: 12px; color: var(--ink-2); margin-top: 6px; min-height: 1em; }
+
+/* Settings dialog */
+dialog {
+  border: 1px solid var(--rule); border-radius: 6px; padding: 0;
+  background: var(--sheet); color: var(--ink); width: min(520px, calc(100vw - 32px));
+}
+dialog::backdrop { background: rgba(20, 24, 28, 0.45); }
+.dlg { padding: 20px; }
+.dlg h2 { margin: 0 0 4px; font-size: 20px; font-weight: 600; font-stretch: 82%; }
+.dlg .hint { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
+.dlg label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
+.dlg input, .dlg select { width: 100%; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 4px; background: var(--paper); }
+.dlg input[readonly] { font: 13px var(--mono); }
+.dlg .inline { display: flex; gap: 8px; }
+.dlg .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.dlg .notice { color: var(--danger); font-size: 13px; margin: 0; min-height: 1em; }
+
+@media (max-width: 860px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 42vh 1fr; }
+  .viewer-wrap { order: -1; border-bottom: 1px solid var(--rule); }
+  .chat { border-right: 0; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <h1>AEC Data Model chat</h1>
+  <span class="status"><span class="dot" id="apsDot"></span><span id="apsStatus">Not signed in to Autodesk</span></span>
+  <span class="status"><span class="dot" id="keyDot"></span><span id="keyStatus">No Anthropic key</span></span>
+  <button class="btn primary" id="signInBtn">Sign in to Autodesk</button>
+  <button class="btn" id="signOutBtn" hidden>Sign out</button>
+  <button class="btn" id="settingsBtn">Settings</button>
+</header>
+
+<main>
+  <section class="chat">
+    <div class="log" id="log" aria-live="polite"></div>
+    <div class="composer">
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="Ask about your models" aria-label="Message"></textarea>
+        <button class="btn primary" id="sendBtn">Send</button>
+        <button class="btn" id="stopBtn" hidden>Stop</button>
+      </div>
+      <div class="sets" id="sets"></div>
+    </div>
+  </section>
+  <section class="viewer-wrap">
+    <div class="viewer-empty" id="viewerEmpty"><p>No model open. Ask Claude to open one, for example "open the first model in my project".</p></div>
+    <div id="apsViewer"></div>
+  </section>
+</main>
+
+<dialog id="settings">
+  <div class="dlg">
+    <h2>Settings</h2>
+    <p class="hint">Stored in this browser only. The API key is cleared when you close the tab.</p>
+    <p class="notice" id="settingsNotice"></p>
+
+    <label for="sClientId">APS client ID (Single Page Application)</label>
+    <input id="sClientId" autocomplete="off" spellcheck="false">
+
+    <label for="sCallback">Callback URL to register in your APS app</label>
+    <div class="inline">
+      <input id="sCallback" readonly>
+      <button class="btn" id="copyCallback">Copy</button>
+    </div>
+
+    <label for="sRegion">AEC Data Model region</label>
+    <select id="sRegion">
+      <option value="">US (default)</option>
+      <option value="EMEA">EMEA</option>
+      <option value="AUS">AUS</option>
+    </select>
+
+    <label for="sKey">Anthropic API key</label>
+    <input id="sKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-...">
+
+    <label for="sModel">Claude model</label>
+    <select id="sModel">
+      <option value="claude-sonnet-5">Claude Sonnet 5</option>
+      <option value="claude-opus-5">Claude Opus 5</option>
+      <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+    </select>
+
+    <div class="actions">
+      <button class="btn" id="cancelSettings">Cancel</button>
+      <button class="btn primary" id="saveSettings">Save settings</button>
+    </div>
+  </div>
+</dialog>
+
+<script>
+/* ============================================================
+   Configuration
+   ============================================================ */
+const CONFIG = {
+  clientId: '',            // Optional: hard-code your APS client ID here instead of using Settings
+  scopes: 'data:read',     // Same scope as the original sample; also covers the Viewer
+  defaultModel: 'claude-sonnet-5',
+  maxAgentSteps: 15,       // Upper bound on tool-use round trips per message
+  elementPageSize: 100,    // GraphQL page size for element queries
+  defaultMaxElements: 2000 // Default cap on elements fetched per query
+};
+const AUTH_URL = 'https://developer.api.autodesk.com/authentication/v2/authorize';
+const TOKEN_URL = 'https://developer.api.autodesk.com/authentication/v2/token';
+const GQL_URL = 'https://developer.api.autodesk.com/aec/graphql';
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+
+/* ============================================================
+   Storage helpers
+   ============================================================ */
+const store = {
+  get(k, s = sessionStorage) { try { return s.getItem(k); } catch { return null; } },
+  set(k, v, s = sessionStorage) { try { v == null ? s.removeItem(k) : s.setItem(k, v); } catch {} }
+};
+const settings = {
+  get clientId() { return store.get('clientId', localStorage) || CONFIG.clientId; },
+  get region()   { return store.get('region', localStorage) || ''; },
+  get model()    { return store.get('model', localStorage) || CONFIG.defaultModel; },
+  get apiKey()   { return store.get('anthropicKey'); }
+};
+const redirectUri = () => location.origin + location.pathname;
+const $ = id => document.getElementById(id);
+
+/* ============================================================
+   APS PKCE auth
+   ============================================================ */
+function b64url(bytes) {
+  let s = '';
+  bytes.forEach(b => s += String.fromCharCode(b));
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function signIn() {
+  if (!settings.clientId) { openSettings('Add your APS client ID before signing in.'); return; }
+  if (!window.isSecureContext) {
+    showError('Sign-in needs a secure page. Open this file from http://localhost or https, not file://.');
+    return;
+  }
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
+  const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier))));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  store.set('pkceVerifier', verifier);
+  store.set('pkceState', state);
+  const p = new URLSearchParams({
+    response_type: 'code',
+    client_id: settings.clientId,
+    redirect_uri: redirectUri(),
+    scope: CONFIG.scopes,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state
+  });
+  location.href = `${AUTH_URL}?${p}`;
+}
+
+async function handleCallback() {
+  const q = new URLSearchParams(location.search);
+  const code = q.get('code');
+  const err = q.get('error');
+  if (!code && !err) return;
+  history.replaceState(null, '', redirectUri());
+  if (err) { showError(`Autodesk sign-in failed: ${q.get('error_description') || err}`); return; }
+  if (q.get('state') !== store.get('pkceState')) {
+    showError('The sign-in response did not match this tab. Sign in again from this tab.');
+    return;
+  }
+  try {
+    await tokenRequest({
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: store.get('pkceVerifier'),
+      redirect_uri: redirectUri()
+    });
+  } catch (e) {
+    showError(e.message);
+  } finally {
+    store.set('pkceVerifier', null);
+    store.set('pkceState', null);
+  }
+}
+
+async function tokenRequest(params) {
+  const previous = JSON.parse(store.get('apsToken') || '{}');
+  const res = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: settings.clientId, ...params })
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Autodesk token request failed: ${j.error_description || j.developerMessage || res.status}`);
+  store.set('apsToken', JSON.stringify({
+    access: j.access_token,
+    refresh: j.refresh_token || previous.refresh,
+    expires: Date.now() + (j.expires_in - 60) * 1000
+  }));
+  updateStatus();
+}
+
+async function getApsToken() {
+  const t = JSON.parse(store.get('apsToken') || 'null');
+  if (!t) throw new Error('Not signed in to Autodesk. Ask the user to click "Sign in to Autodesk".');
+  if (Date.now() < t.expires) return t.access;
+  if (!t.refresh) throw new Error('The Autodesk session expired. Ask the user to sign in again.');
+  await tokenRequest({ grant_type: 'refresh_token', refresh_token: t.refresh, scope: CONFIG.scopes });
+  return JSON.parse(store.get('apsToken')).access;
+}
+
+function signOut() {
+  store.set('apsToken', null);
+  updateStatus();
+}
+
+/* ============================================================
+   AEC Data Model GraphQL
+   ============================================================ */
+async function gql(query, variables = {}) {
+  const token = await getApsToken();
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+  if (settings.region) headers.region = settings.region;
+  let res;
+  try {
+    res = await fetch(GQL_URL, { method: 'POST', headers, body: JSON.stringify({ query, variables }) });
+  } catch {
+    throw new Error('The browser could not reach the AEC Data Model API. If the network is fine, the request was probably blocked by CORS; the browser console will say.');
+  }
+  const text = await res.text();
+  let j = null;
+  try { j = JSON.parse(text); } catch {}
+  if (res.status === 401) throw new Error('Autodesk rejected the token (401). Sign in again.');
+  if (!j) throw new Error(`AEC Data Model API returned ${res.status}: ${text.slice(0, 200)}`);
+  if (j.errors?.length && !j.data) throw new Error(j.errors.map(e => e.message).join('; '));
+  return { data: j.data, rawChars: text.length };
+}
+
+// Follows pagination cursors until done or maxItems is reached.
+async function gqlAll(query, vars, path, maxItems) {
+  const items = [];
+  let cursor = null, pages = 0, rawChars = 0;
+  do {
+    const { data, rawChars: n } = await gql(query, { ...vars, cursor });
+    rawChars += n;
+    const node = path.split('.').reduce((o, k) => o?.[k], data);
+    items.push(...(node?.results || []));
+    cursor = node?.pagination?.cursor || null;
+    pages++;
+  } while (cursor && items.length < maxItems && pages < 200);
+  return { items: items.slice(0, maxItems), truncated: !!cursor || items.length > maxItems, rawChars };
+}
+
+const Q_HUBS = `
+query ($cursor: String) {
+  hubs(pagination: {cursor: $cursor}) {
+    pagination { cursor }
+    results { id name }
+  }
+}`;
+
+const Q_PROJECTS = `
+query ($hubId: ID!, $cursor: String) {
+  projects(hubId: $hubId, pagination: {cursor: $cursor}) {
+    pagination { cursor }
+    results { id name }
+  }
+}`;
+
+const Q_ELEMENT_GROUPS = `
+query ($projectId: ID!, $cursor: String) {
+  elementGroupsByProject(projectId: $projectId, pagination: {cursor: $cursor}) {
+    pagination { cursor }
+    results { id name alternativeIdentifiers { fileVersionUrn } }
+  }
+}`;
+
+const Q_ELEMENTS_ALL_PROPS = `
+query ($elementGroupId: ID!, $filter: String!, $cursor: String, $limit: Int) {
+  elementsByElementGroup(elementGroupId: $elementGroupId, filter: {query: $filter}, pagination: {cursor: $cursor, limit: $limit}) {
+    pagination { cursor }
+    results { id name properties { results { name value } } }
+  }
+}`;
+
+const Q_ELEMENTS_SOME_PROPS = `
+query ($elementGroupId: ID!, $filter: String!, $cursor: String, $limit: Int, $names: [String!]!) {
+  elementsByElementGroup(elementGroupId: $elementGroupId, filter: {query: $filter}, pagination: {cursor: $cursor, limit: $limit}) {
+    pagination { cursor }
+    results { id name properties(filter: {names: $names}) { results { name value } } }
+  }
+}`;
+
+/* ============================================================
+   Result sets: full data stays here, Claude sees summaries
+   ============================================================ */
+const sets = new Map();
+let setCounter = 0;
+
+function makeSet(rows, meta) {
+  const id = `set_${++setCounter}`;
+  sets.set(id, { id, rows, ...meta });
+  renderSets();
+  return sets.get(id);
+}
+function getSet(id) {
+  const s = sets.get(id);
+  if (!s) throw new Error(`Unknown result set "${id}". Available: ${[...sets.keys()].join(', ') || 'none'}.`);
+  return s;
+}
+const num = v => typeof v === 'number' ? v
+  : (typeof v === 'string' && v.trim() !== '' && isFinite(+v)) ? +v : null;
+const cell = v => v == null ? '' : String(v).replace(/[\t\r\n]+/g, ' ').slice(0, 80);
+const fmt = n => Number.isInteger(n) ? String(n) : n.toFixed(3).replace(/\.?0+$/, '');
+
+function propertyStats(rows) {
+  const stats = new Map();
+  for (const r of rows) {
+    for (const [k, v] of Object.entries(r.props)) {
+      if (v == null || v === '') continue;
+      const s = stats.get(k) || { filled: 0, numeric: 0, values: new Set() };
+      s.filled++;
+      if (num(v) != null) s.numeric++;
+      if (s.values.size <= 20) s.values.add(String(v));
+      stats.set(k, s);
+    }
+  }
+  return [...stats.entries()].sort((a, b) => b[1].filled - a[1].filled);
+}
+
+function describeSet(s) {
+  const stats = propertyStats(s.rows);
+  const propLines = stats.slice(0, 60).map(([k, st]) => {
+    const kind = st.numeric === st.filled ? 'numeric'
+      : st.values.size <= 20 ? `${st.values.size} distinct` : 'text';
+    return `${k} [${st.filled}, ${kind}]`;
+  });
+  const sampleCols = stats.filter(([k]) => k !== 'External ID').slice(0, 6).map(([k]) => k);
+  const sample = s.rows.slice(0, 5).map(r => [r.name, ...sampleCols.map(c => r.props[c])].map(cell).join('\t'));
+  return [
+    `${s.id}: ${s.rows.length} elements. Source: ${s.source}.${s.truncated ? ' TRUNCATED at the element cap; more elements exist.' : ''}`,
+    `Properties [filled count, kind]: ${propLines.join('; ')}${stats.length > 60 ? `; plus ${stats.length - 60} more` : ''}`,
+    `Sample (first ${sample.length}), tab-separated:`,
+    ['name', ...sampleCols].join('\t'),
+    ...sample
+  ].join('\n');
+}
+
+function renderSets() {
+  const el = $('sets');
+  if (!sets.size) { el.textContent = ''; return; }
+  el.textContent = 'Held in this tab: ' + [...sets.values()].map(s => `${s.id} (${s.rows.length} ${s.label})`).join(', ');
+}
+
+/* ============================================================
+   Viewer
+   ============================================================ */
+let viewer = null, viewerReady = null;
+
+function initViewer() {
+  if (viewerReady) return viewerReady;
+  viewerReady = new Promise((resolve, reject) => {
+    if (!window.Autodesk?.Viewing) { reject(new Error('The APS Viewer script did not load.')); return; }
+    const options = {
+      env: 'AutodeskProduction2',
+      api: settings.region === 'EMEA' ? 'streamingV2_EU' : 'streamingV2',
+      getAccessToken: async cb => {
+        try {
+          const token = await getApsToken();
+          const t = JSON.parse(store.get('apsToken'));
+          cb(token, Math.max(60, Math.floor((t.expires - Date.now()) / 1000)));
+        } catch (e) { console.error(e); }
+      }
+    };
+    Autodesk.Viewing.Initializer(options, () => {
+      viewer = new Autodesk.Viewing.GuiViewer3D($('apsViewer'), { extensions: ['Autodesk.DocumentBrowser'] });
+      viewer.start();
+      const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+      viewer.setTheme(dark ? 'dark-theme' : 'light-theme');
+      $('viewerEmpty').hidden = true;
+      resolve(viewer);
+    });
+  });
+  viewerReady.catch(() => { viewerReady = null; });
+  return viewerReady;
+}
+
+async function renderModel(fileVersionUrn) {
+  await getApsToken();
+  await initViewer();
+  const docUrn = 'urn:' + b64url(new TextEncoder().encode(fileVersionUrn));
+  return new Promise((resolve, reject) => {
+    Autodesk.Viewing.Document.load(docUrn, async doc => {
+      try {
+        const node = doc.getRoot().getDefaultGeometry();
+        if (!node) throw new Error('The file has no viewable geometry.');
+        viewer.getVisibleModels().forEach(m => viewer.unloadModel(m));
+        await viewer.loadDocumentNode(doc, node);
+        if (viewer.waitForLoadDone) await viewer.waitForLoadDone({ propDb: true, geometry: false });
+        resolve('Model loaded in the viewer.');
+      } catch (e) { reject(e); }
+    }, (code, message) => reject(new Error(`The viewer could not load this file (code ${code}${message ? ': ' + message : ''}). It may not be translated yet, or the URN may be wrong.`)));
+  });
+}
+
+async function isolateByExternalIds(ids) {
+  if (!viewer?.model) throw new Error('No model is open in the viewer. Call render_model first.');
+  const map = await new Promise((res, rej) => viewer.model.getExternalIdMapping(res, rej));
+  const dbids = ids.map(i => map[i]).filter(x => x != null);
+  viewer.isolate(dbids);
+  viewer.fitToView(dbids);
+  const missing = ids.length - dbids.length;
+  return `Isolated ${dbids.length} of ${ids.length} elements in the viewer.` +
+    (missing ? ` ${missing} External IDs were not found in the open model; it may be a different model or version than the query came from.` : '');
+}
+
+/* ============================================================
+   Tools
+   ============================================================ */
+const TOOLS = [
+  {
+    name: 'get_hubs',
+    description: 'List the ACC/BIM 360 hubs the signed-in user can access. Returns name and id.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_projects',
+    description: 'List projects in a hub. Returns name and id.',
+    input_schema: { type: 'object', properties: { hubId: { type: 'string', description: 'Hub id from get_hubs' } }, required: ['hubId'] }
+  },
+  {
+    name: 'get_element_groups',
+    description: 'List element groups (models) in a project. Returns name, id and fileVersionUrn. The id is used by query_elements; the fileVersionUrn is used by render_model.',
+    input_schema: { type: 'object', properties: { projectId: { type: 'string', description: 'Project id from get_projects' } }, required: ['projectId'] }
+  },
+  {
+    name: 'query_elements',
+    description: 'Fetch elements from an element group and store them in the browser as a result set. You receive a summary (count, available properties, a small sample), not the full data. Use summarize_set, filter_set and get_rows to work with the set afterwards.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        elementGroupId: { type: 'string' },
+        category: { type: 'string', description: 'Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the filter property.name.category==<category>.' },
+        filter: { type: 'string', description: 'Raw AEC Data Model filter query. Use instead of category for other filters.' },
+        propertyNames: { type: 'array', items: { type: 'string' }, description: 'Only fetch these properties (External ID is always added). Omit to fetch all properties, which is heavier but lets you discover what exists.' },
+        maxElements: { type: 'integer', description: `Cap on elements fetched. Default ${CONFIG.defaultMaxElements}.` }
+      },
+      required: ['elementGroupId']
+    }
+  },
+  {
+    name: 'summarize_set',
+    description: 'Aggregate a result set in the browser. Group by a property to get counts, and optionally sum/average/min/max a numeric property per group. Prefer this over reading rows for any count or total.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        setId: { type: 'string' },
+        groupBy: { type: 'string', description: 'Property name to group by. Omit for totals over the whole set.' },
+        measure: { type: 'string', description: 'Numeric property to aggregate, e.g. Area or Volume.' }
+      },
+      required: ['setId']
+    }
+  },
+  {
+    name: 'filter_set',
+    description: 'Create a new result set from an existing one by testing one property. Returns a summary of the new set.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        setId: { type: 'string' },
+        property: { type: 'string', description: 'Property name, or "name" for the element name.' },
+        op: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'gt', 'gte', 'lt', 'lte', 'is_empty', 'not_empty'] },
+        value: { type: 'string', description: 'Comparison value (text comparisons are case-insensitive).' }
+      },
+      required: ['setId', 'property', 'op']
+    }
+  },
+  {
+    name: 'get_rows',
+    description: 'Read individual elements from a result set as a tab-separated table. Use only when specific elements matter, and keep pages small.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        setId: { type: 'string' },
+        properties: { type: 'array', items: { type: 'string' }, description: 'Columns to include besides name.' },
+        offset: { type: 'integer' },
+        limit: { type: 'integer', description: 'Max 100, default 25.' }
+      },
+      required: ['setId', 'properties']
+    }
+  },
+  {
+    name: 'render_model',
+    description: 'Open a model in the Autodesk Viewer next to the chat, using the fileVersionUrn from get_element_groups.',
+    input_schema: { type: 'object', properties: { fileVersionUrn: { type: 'string' } }, required: ['fileVersionUrn'] }
+  },
+  {
+    name: 'highlight_elements',
+    description: 'Isolate elements in the viewer. Pass a setId to isolate every element in that set (preferred; the ids never pass through you), or a short list of External IDs.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        setId: { type: 'string' },
+        externalIds: { type: 'array', items: { type: 'string' } }
+      }
+    }
+  },
+  {
+    name: 'clear_highlight',
+    description: 'Show all elements in the viewer again.',
+    input_schema: { type: 'object', properties: {} },
+    cache_control: { type: 'ephemeral' }
+  }
+];
+
+const toTsv = (header, rows) => [header.join('\t'), ...rows.map(r => r.map(cell).join('\t'))].join('\n');
+
+const TOOL_IMPL = {
+  async get_hubs() {
+    const r = await gqlAll(Q_HUBS, {}, 'hubs', 500);
+    return { text: toTsv(['name', 'id'], r.items.map(h => [h.name, h.id])), rawChars: r.rawChars };
+  },
+
+  async get_projects({ hubId }) {
+    const r = await gqlAll(Q_PROJECTS, { hubId }, 'projects', 1000);
+    const shown = r.items.slice(0, 300);
+    let text = toTsv(['name', 'id'], shown.map(p => [p.name, p.id]));
+    if (r.items.length > shown.length) text += `\n(${r.items.length - shown.length} more projects not shown)`;
+    return { text, rawChars: r.rawChars };
+  },
+
+  async get_element_groups({ projectId }) {
+    const r = await gqlAll(Q_ELEMENT_GROUPS, { projectId }, 'elementGroupsByProject', 1000);
+    const text = r.items.length
+      ? toTsv(['name', 'id', 'fileVersionUrn'], r.items.map(g => [g.name, g.id, g.alternativeIdentifiers?.fileVersionUrn]))
+      : 'No element groups in this project. The AEC Data Model only covers Revit files uploaded after the project was enabled for it.';
+    return { text, rawChars: r.rawChars };
+  },
+
+  async query_elements({ elementGroupId, category, filter, propertyNames, maxElements }) {
+    const query = filter || (category ? `property.name.category==${category}` : null);
+    if (!query) throw new Error('Provide a category or a filter.');
+    const cap = Math.max(1, Math.min(maxElements || CONFIG.defaultMaxElements, 20000));
+    const names = propertyNames?.length ? [...new Set([...propertyNames, 'External ID'])] : null;
+    const vars = { elementGroupId, filter: query, limit: CONFIG.elementPageSize, ...(names ? { names } : {}) };
+    const r = await gqlAll(names ? Q_ELEMENTS_SOME_PROPS : Q_ELEMENTS_ALL_PROPS, vars, 'elementsByElementGroup', cap);
+    const rows = r.items.map(e => {
+      const props = {};
+      for (const p of e.properties?.results || []) props[p.name] = p.value;
+      return { id: e.id, name: e.name, externalId: props['External ID'] ?? null, props };
+    });
+    if (!rows.length) return { text: `No elements matched "${query}".`, rawChars: r.rawChars };
+    const s = makeSet(rows, {
+      source: `filter "${query}" on element group ${elementGroupId}`,
+      label: (category || 'elements').toLowerCase(),
+      truncated: r.truncated
+    });
+    return { text: describeSet(s), rawChars: r.rawChars };
+  },
+
+  async summarize_set({ setId, groupBy, measure }) {
+    const s = getSet(setId);
+    const groups = new Map();
+    for (const r of s.rows) {
+      const key = groupBy ? (r.props[groupBy] ?? (groupBy === 'name' ? r.name : '(empty)')) : '(all)';
+      const g = groups.get(key) || { count: 0, sum: 0, n: 0, min: Infinity, max: -Infinity };
+      g.count++;
+      if (measure) {
+        const v = num(r.props[measure]);
+        if (v != null) { g.sum += v; g.n++; g.min = Math.min(g.min, v); g.max = Math.max(g.max, v); }
+      }
+      groups.set(key, g);
+    }
+    const sorted = [...groups.entries()].sort((a, b) => b[1].count - a[1].count);
+    const header = [groupBy || 'group', 'count', ...(measure ? [`${measure} sum`, 'avg', 'min', 'max', 'with value'] : [])];
+    const rows = sorted.slice(0, 80).map(([k, g]) => [k, g.count, ...(measure
+      ? (g.n ? [fmt(g.sum), fmt(g.sum / g.n), fmt(g.min), fmt(g.max), g.n] : ['', '', '', '', 0])
+      : [])]);
+    let text = `${s.id}, ${s.rows.length} elements${s.truncated ? ' (set is truncated)' : ''}\n` + toTsv(header, rows);
+    if (sorted.length > 80) text += `\n(${sorted.length - 80} smaller groups not shown)`;
+    if (measure) text += '\nValues are raw API numbers; units follow the model settings (often metric internal units).';
+    return { text };
+  },
+
+  async filter_set({ setId, property, op, value }) {
+    const s = getSet(setId);
+    const lc = x => String(x ?? '').toLowerCase();
+    const get = r => property === 'name' ? r.name : r.props[property];
+    const test = {
+      equals: v => lc(v) === lc(value),
+      not_equals: v => lc(v) !== lc(value),
+      contains: v => lc(v).includes(lc(value)),
+      gt: v => num(v) != null && num(v) > +value,
+      gte: v => num(v) != null && num(v) >= +value,
+      lt: v => num(v) != null && num(v) < +value,
+      lte: v => num(v) != null && num(v) <= +value,
+      is_empty: v => v == null || v === '',
+      not_empty: v => v != null && v !== ''
+    }[op];
+    if (!test) throw new Error(`Unknown op "${op}".`);
+    const rows = s.rows.filter(r => test(get(r)));
+    if (!rows.length) return { text: `No elements in ${s.id} where ${property} ${op} ${value ?? ''}.` };
+    const n = makeSet(rows, { source: `${s.id} where ${property} ${op} ${value ?? ''}`, label: s.label, truncated: s.truncated });
+    return { text: describeSet(n) };
+  },
+
+  async get_rows({ setId, properties = [], offset = 0, limit = 25 }) {
+    const s = getSet(setId);
+    limit = Math.max(1, Math.min(limit, 100));
+    const page = s.rows.slice(offset, offset + limit);
+    let text = toTsv(['name', ...properties], page.map(r => [r.name, ...properties.map(p => r.props[p])]));
+    text += `\nRows ${offset + 1}-${offset + page.length} of ${s.rows.length}.`;
+    return { text };
+  },
+
+  async render_model({ fileVersionUrn }) {
+    return { text: await renderModel(fileVersionUrn) };
+  },
+
+  async highlight_elements({ setId, externalIds }) {
+    let ids = externalIds || [];
+    if (setId) {
+      const s = getSet(setId);
+      ids = s.rows.map(r => r.externalId).filter(Boolean);
+      if (!ids.length) throw new Error(`${setId} has no External ID values, so its elements cannot be matched in the viewer.`);
+    }
+    if (!ids.length) throw new Error('Provide a setId or externalIds.');
+    return { text: await isolateByExternalIds(ids) };
+  },
+
+  async clear_highlight() {
+    if (!viewer?.model) return { text: 'No model is open.' };
+    viewer.isolate([]);
+    viewer.showAll();
+    viewer.fitToView();
+    return { text: 'All elements visible.' };
+  }
+};
+
+/* ============================================================
+   Claude agent loop
+   ============================================================ */
+const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revit models in ACC) through tools, with an Autodesk Viewer shown next to the chat.
+
+Navigation: get_hubs, then get_projects, then get_element_groups. If the user names a hub, project or model, find it by name and don't ask for ids. If a name is ambiguous, list the candidates briefly.
+
+Element data: query_elements stores full results in the user's browser as a result set (set_1, set_2, ...) and gives you only a summary. Work with sets through summarize_set for counts and totals, filter_set to narrow, and get_rows only when individual elements matter. Never page through a whole large set with get_rows. If a set is marked truncated, say so when reporting totals.
+
+Viewer: render_model takes the fileVersionUrn from get_element_groups. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
+
+Property names come from the summary returned by query_elements; use them exactly. Numeric values are raw API numbers, so state units with care.
+
+Be concise. Use small markdown tables for tabular answers.`;
+
+let history = [];
+let busy = false, stopRequested = false, abortCtl = null;
+
+async function callClaude(messages) {
+  abortCtl = new AbortController();
+  const res = await fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    signal: abortCtl.signal,
+    headers: {
+      'x-api-key': settings.apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: settings.model,
+      max_tokens: 4096,
+      system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
+      tools: TOOLS,
+      messages
+    })
+  });
+  const j = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(`Anthropic API: ${j?.error?.message || res.status}`);
+  return j;
+}
+
+// Tool results from earlier turns are shortened before each request, so old
+// payloads don't keep costing tokens. The data itself stays in the result sets.
+function pruneForRequest(msgs, currentTurnStart) {
+  return msgs.map((m, i) => {
+    if (i >= currentTurnStart || m.role !== 'user' || !Array.isArray(m.content)) return m;
+    return {
+      ...m,
+      content: m.content.map(b => (b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > 600)
+        ? { ...b, content: b.content.slice(0, 600) + '\n[Earlier result shortened. Any result set it created is still available.]' }
+        : b)
+    };
+  });
+}
+
+async function send(text) {
+  if (busy || !text.trim()) return;
+  if (!settings.apiKey) { openSettings('Add an Anthropic API key to start chatting.'); return; }
+  busy = true; stopRequested = false; setBusy(true);
+  $('log').querySelector('.starter')?.remove();
+
+  const turnStart = history.length;
+  history.push({ role: 'user', content: text });
+  addUserMsg(text);
+
+  try {
+    for (let step = 0; step < CONFIG.maxAgentSteps; step++) {
+      const resp = await callClaude(pruneForRequest(history, turnStart));
+      history.push({ role: 'assistant', content: resp.content });
+
+      for (const b of resp.content) if (b.type === 'text' && b.text.trim()) addAssistantMsg(b.text);
+      addUsage(resp.usage);
+
+      if (resp.stop_reason !== 'tool_use') {
+        if (resp.stop_reason === 'max_tokens') showError('The reply hit the length limit and was cut off.');
+        break;
+      }
+
+      const results = [];
+      for (const b of resp.content.filter(b => b.type === 'tool_use')) {
+        const slip = addSlip(b);
+        if (stopRequested) {
+          results.push({ type: 'tool_result', tool_use_id: b.id, content: 'Stopped by the user.', is_error: true });
+          slip.fail('Stopped');
+          continue;
+        }
+        try {
+          const impl = TOOL_IMPL[b.name];
+          if (!impl) throw new Error(`Unknown tool ${b.name}`);
+          const out = await impl(b.input || {});
+          results.push({ type: 'tool_result', tool_use_id: b.id, content: out.text });
+          slip.done(out);
+        } catch (e) {
+          results.push({ type: 'tool_result', tool_use_id: b.id, content: `Error: ${e.message}`, is_error: true });
+          slip.fail(e.message);
+        }
+      }
+      history.push({ role: 'user', content: results });
+      if (stopRequested) { showError('Stopped.'); break; }
+      if (step === CONFIG.maxAgentSteps - 1) showError(`Stopped after ${CONFIG.maxAgentSteps} tool rounds. Ask again to continue.`);
+    }
+  } catch (e) {
+    // Roll the failed turn back so the history stays valid for the API.
+    history = history.slice(0, turnStart);
+    showError(e.name === 'AbortError' ? 'Stopped.' : e.message);
+    $('input').value = text;
+  } finally {
+    busy = false; abortCtl = null; setBusy(false);
+  }
+}
+
+/* ============================================================
+   Rendering
+   ============================================================ */
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function md(src) {
+  const inline = s => esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');
+  const lines = src.split('\n');
+  const isTable = l => /^\s*\|.*\|\s*$/.test(l);
+  const isUl = l => /^\s*[-*] /.test(l);
+  const isOl = l => /^\s*\d+[.)] /.test(l);
+  const isHead = l => /^#{1,4} /.test(l);
+  let html = '', i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (l.startsWith('```')) {
+      const code = []; i++;
+      while (i < lines.length && !lines[i].startsWith('```')) code.push(lines[i++]);
+      i++;
+      html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
+    } else if (isTable(l)) {
+      const rows = [];
+      while (i < lines.length && isTable(lines[i])) rows.push(lines[i++]);
+      const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      const body = rows.filter(r => !/^\s*\|[\s:|-]+\|\s*$/.test(r));
+      html += '<div class="tablewrap"><table>' + body.map((r, ri) =>
+        '<tr>' + cells(r).map(c => ri === 0 ? `<th>${inline(c)}</th>` : `<td>${inline(c)}</td>`).join('') + '</tr>'
+      ).join('') + '</table></div>';
+    } else if (isUl(l) || isOl(l)) {
+      const ordered = isOl(l), items = [];
+      while (i < lines.length && (ordered ? isOl(lines[i]) : isUl(lines[i]))) items.push(lines[i++].replace(/^\s*([-*]|\d+[.)]) /, ''));
+      const tag = ordered ? 'ol' : 'ul';
+      html += `<${tag}>` + items.map(x => `<li>${inline(x)}</li>`).join('') + `</${tag}>`;
+    } else if (isHead(l)) {
+      html += `<h4>${inline(l.replace(/^#+ /, ''))}</h4>`; i++;
+    } else if (!l.trim()) {
+      i++;
+    } else {
+      const para = [];
+      while (i < lines.length && lines[i].trim() && !lines[i].startsWith('```') && !isTable(lines[i]) && !isUl(lines[i]) && !isOl(lines[i]) && !isHead(lines[i])) para.push(lines[i++]);
+      html += `<p>${inline(para.join(' '))}</p>`;
+    }
+  }
+  return html;
+}
+
+function append(el) {
+  const log = $('log');
+  const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  log.appendChild(el);
+  if (nearBottom) log.scrollTop = log.scrollHeight;
+  return el;
+}
+function addUserMsg(text) {
+  const d = document.createElement('div');
+  d.className = 'msg user';
+  d.textContent = text;
+  append(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+function addAssistantMsg(text) {
+  const d = document.createElement('div');
+  d.className = 'msg assistant';
+  d.innerHTML = md(text);
+  append(d);
+}
+function addUsage(u) {
+  if (!u) return;
+  const d = document.createElement('div');
+  d.className = 'usage';
+  const cached = u.cache_read_input_tokens ? `, ${u.cache_read_input_tokens.toLocaleString()} from cache` : '';
+  d.textContent = `${(u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)).toLocaleString()} tokens in${cached}, ${u.output_tokens.toLocaleString()} out`;
+  append(d);
+}
+function showError(msg) {
+  const d = document.createElement('div');
+  d.className = 'error';
+  d.textContent = msg;
+  append(d);
+}
+const approxTokens = chars => Math.max(1, Math.round(chars / 4));
+
+function addSlip(block) {
+  const d = document.createElement('details');
+  d.className = 'slip running';
+  const args = Object.keys(block.input || {}).length ? JSON.stringify(block.input, null, 2) : '(no arguments)';
+  d.innerHTML = `<summary><span class="name">${esc(block.name)}</span><span class="note">running</span></summary><pre>${esc(args)}</pre>`;
+  append(d);
+  const note = d.querySelector('.note');
+  return {
+    done(out) {
+      d.classList.remove('running');
+      const sent = approxTokens(out.text.length);
+      note.textContent = out.rawChars
+        ? `Claude saw about ${sent.toLocaleString()} tokens of a ${approxTokens(out.rawChars).toLocaleString()}-token response`
+        : `about ${sent.toLocaleString()} tokens to Claude`;
+      const pre = document.createElement('pre');
+      pre.textContent = out.text;
+      d.appendChild(pre);
+    },
+    fail(msg) {
+      d.classList.remove('running');
+      d.classList.add('failed');
+      note.textContent = msg;
+    }
+  };
+}
+
+function renderStarter() {
+  const d = document.createElement('div');
+  d.className = 'starter';
+  d.innerHTML = `<h2>Ask about your models</h2>
+    <p>Claude reads your ACC data through the AEC Data Model API. Large query results stay in this tab, and Claude works with summaries of them.</p>`;
+  const prompts = [
+    'List my hubs and the projects in each',
+    'Open the first model in my most recent project',
+    'Count the doors in this model by level, then show them in the viewer',
+    'Which walls have the largest area? Show the top ten'
+  ];
+  for (const p of prompts) {
+    const b = document.createElement('button');
+    b.textContent = p;
+    b.onclick = () => { $('input').value = p; $('input').focus(); };
+    d.appendChild(b);
+  }
+  $('log').appendChild(d);
+}
+
+/* ============================================================
+   UI wiring
+   ============================================================ */
+function updateStatus() {
+  const t = JSON.parse(store.get('apsToken') || 'null');
+  const signedIn = !!t;
+  $('apsDot').classList.toggle('on', signedIn);
+  $('apsStatus').textContent = signedIn ? 'Signed in to Autodesk' : 'Not signed in to Autodesk';
+  $('signInBtn').hidden = signedIn;
+  $('signOutBtn').hidden = !signedIn;
+  $('keyDot').classList.toggle('on', !!settings.apiKey);
+  $('keyStatus').textContent = settings.apiKey ? 'Anthropic key set' : 'No Anthropic key';
+}
+function setBusy(b) {
+  $('sendBtn').hidden = b;
+  $('stopBtn').hidden = !b;
+  $('input').disabled = b;
+  if (!b) $('input').focus();
+}
+function openSettings(notice = '') {
+  $('settingsNotice').textContent = notice;
+  $('sClientId').value = settings.clientId;
+  $('sCallback').value = redirectUri();
+  $('sRegion').value = settings.region;
+  $('sKey').value = settings.apiKey || '';
+  $('sModel').value = settings.model;
+  $('settings').showModal();
+}
+function saveSettings() {
+  store.set('clientId', $('sClientId').value.trim() || null, localStorage);
+  store.set('region', $('sRegion').value || null, localStorage);
+  store.set('model', $('sModel').value, localStorage);
+  store.set('anthropicKey', $('sKey').value.trim() || null);
+  $('settings').close();
+  updateStatus();
+}
+
+$('signInBtn').onclick = signIn;
+$('signOutBtn').onclick = signOut;
+$('settingsBtn').onclick = () => openSettings();
+$('saveSettings').onclick = saveSettings;
+$('cancelSettings').onclick = () => $('settings').close();
+$('copyCallback').onclick = async () => {
+  try { await navigator.clipboard.writeText(redirectUri()); $('copyCallback').textContent = 'Copied'; }
+  catch { $('sCallback').select(); }
+  setTimeout(() => $('copyCallback').textContent = 'Copy', 1500);
+};
+$('sendBtn').onclick = () => { const v = $('input').value; $('input').value = ''; send(v); };
+$('stopBtn').onclick = () => { stopRequested = true; abortCtl?.abort(); };
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('sendBtn').click(); }
+});
+$('input').addEventListener('input', e => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 180) + 'px';
+});
+
+(async () => {
+  renderStarter();
+  await handleCallback();
+  updateStatus();
+  if (!settings.clientId || !settings.apiKey) {
+    const missing = [!settings.clientId && 'your APS client ID', !settings.apiKey && 'an Anthropic API key'].filter(Boolean).join(' and ');
+    openSettings(`Add ${missing} to get started.`);
+  }
+})();
+</script>
+</body>
+</html>
