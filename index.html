@@ -331,7 +331,7 @@ async function handleCallback() {
   const code = q.get('code');
   const err = q.get('error');
   if (!code && !err) return;
-  history.replaceState(null, '', redirectUri());
+  window.history.replaceState(null, '', redirectUri());
   if (err) { showError(`Autodesk sign-in failed: ${q.get('error_description') || err}`); return; }
   if (q.get('state') !== store.get('pkceState')) {
     showError('The sign-in response did not match this tab. Sign in again from this tab.');
@@ -821,7 +821,7 @@ Property names come from the summary returned by query_elements; use them exactl
 
 Be concise. Use small markdown tables for tabular answers.`;
 
-let history = [];
+let chatHistory = [];
 let busy = false, stopRequested = false, abortCtl = null;
 
 async function callClaude(messages) {
@@ -868,14 +868,14 @@ async function send(text) {
   busy = true; stopRequested = false; setBusy(true);
   $('log').querySelector('.starter')?.remove();
 
-  const turnStart = history.length;
-  history.push({ role: 'user', content: text });
+  const turnStart = chatHistory.length;
+  chatHistory.push({ role: 'user', content: text });
   addUserMsg(text);
 
   try {
     for (let step = 0; step < CONFIG.maxAgentSteps; step++) {
-      const resp = await callClaude(pruneForRequest(history, turnStart));
-      history.push({ role: 'assistant', content: resp.content });
+      const resp = await callClaude(pruneForRequest(chatHistory, turnStart));
+      chatHistory.push({ role: 'assistant', content: resp.content });
 
       for (const b of resp.content) if (b.type === 'text' && b.text.trim()) addAssistantMsg(b.text);
       addUsage(resp.usage);
@@ -904,13 +904,13 @@ async function send(text) {
           slip.fail(e.message);
         }
       }
-      history.push({ role: 'user', content: results });
+      chatHistory.push({ role: 'user', content: results });
       if (stopRequested) { showError('Stopped.'); break; }
       if (step === CONFIG.maxAgentSteps - 1) showError(`Stopped after ${CONFIG.maxAgentSteps} tool rounds. Ask again to continue.`);
     }
   } catch (e) {
-    // Roll the failed turn back so the history stays valid for the API.
-    history = history.slice(0, turnStart);
+    // Roll the failed turn back so the chatHistory stays valid for the API.
+    chatHistory = chatHistory.slice(0, turnStart);
     showError(e.name === 'AbortError' ? 'Stopped.' : e.message);
     $('input').value = text;
   } finally {
