@@ -616,8 +616,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         elementGroupId: { type: 'string' },
-        category: { type: 'string', description: "Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the RSQL filter 'property.name.category'=='<category>'." },
-        filter: { type: 'string', description: 'Raw AEC Data Model filter query. Use instead of category for other filters.' },
+        category: { type: 'string', description: "Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the RSQL filter 'property.name.category'=='<category>', scoped by 'scope' (instances only by default)." },
+        filter: { type: 'string', description: 'Raw AEC Data Model filter query. Use instead of category for other filters. Not scoped automatically - include your own Element Context clause if you need to restrict to instances or types.' },
+        scope: { type: 'string', enum: ['instances', 'types', 'all'], description: "Only applies with 'category'. 'instances' (default) returns placed instances only, via 'property.name.Element Context'=='Instance' - the right choice for counts, totals, and anything highlighted in the viewer, since Type rows have no 3D geometry. 'types' returns only Type-level rows (family types/type catalog entries) for questions about type definitions. 'all' returns both instance and type rows together." },
         propertyNames: { type: 'array', items: { type: 'string' }, description: 'Only fetch these properties (External ID is always added). Omit to fetch all properties, which is heavier but lets you discover what exists.' },
         maxElements: { type: 'integer', description: `Cap on elements fetched. Default ${CONFIG.defaultMaxElements}.` }
       },
@@ -717,10 +718,15 @@ const TOOL_IMPL = {
     return { text, rawChars: r.rawChars };
   },
 
-  async query_elements({ elementGroupId, category, filter, propertyNames, maxElements }) {
-    const query = filter || (category
-      ? `'property.name.category'=='${String(category).replace(/'/g, "\\'")}'`
-      : null);
+  async query_elements({ elementGroupId, category, filter, scope, propertyNames, maxElements }) {
+    let query = filter;
+    if (!query && category) {
+      const catClause = `'property.name.category'=='${String(category).replace(/'/g, "\\'")}'`;
+      const contextClause = scope === 'types' ? "'property.name.Element Context'=='Type'"
+        : scope === 'all' ? null
+        : "'property.name.Element Context'=='Instance'";
+      query = contextClause ? `${catClause} and ${contextClause}` : catClause;
+    }
     if (!query) throw new Error('Provide a category or a filter.');
     const cap = Math.max(1, Math.min(maxElements || CONFIG.defaultMaxElements, 20000));
     const names = propertyNames?.length ? [...new Set([...propertyNames, 'External ID'])] : null;
@@ -827,6 +833,8 @@ const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revi
 Navigation: get_hubs, then get_projects, then get_element_groups. If the user names a hub, project or model, find it by name and don't ask for ids. If a name is ambiguous, list the candidates briefly.
 
 Element data: query_elements stores full results in the user's browser as a result set (set_1, set_2, ...) and gives you only a summary. Work with sets through summarize_set for counts and totals, filter_set to narrow, and get_rows only when individual elements matter. Never page through a whole large set with get_rows. If a set is marked truncated, say so when reporting totals.
+
+When querying by category, query_elements defaults to instances only (scope: 'instances') - placed elements with real geometry, which is what counts, totals and viewer highlighting should be based on. Only pass scope: 'types' or 'all' when the user is specifically asking about family types, type catalogs, or wants both together; say so if you switch scope for that reason.
 
 Viewer: render_model takes the fileVersionUrn from get_element_groups. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
 
