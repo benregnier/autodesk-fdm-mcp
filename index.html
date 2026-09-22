@@ -60,7 +60,7 @@ body {
   color: var(--ink);
   font: 400 15px/1.5 var(--sans);
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto 1fr auto;
 }
 button, input, select, textarea { font: inherit; color: inherit; }
 :focus-visible { outline: 2px solid var(--pencil); outline-offset: 2px; }
@@ -189,8 +189,35 @@ dialog::backdrop { background: rgba(20, 24, 28, 0.45); }
   main { grid-template-columns: 1fr; grid-template-rows: 42vh 1fr; }
   .viewer-wrap { order: -1; border-bottom: 1px solid var(--rule); }
   .chat { border-right: 0; }
+  .tp-body { max-height: 32vh; }
 }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+
+/* Table panel */
+.table-panel { border-top: 1px solid var(--rule); background: var(--sheet); display: flex; flex-direction: column; min-height: 0; }
+.table-panel[hidden] { display: none; }
+.tp-bar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; flex-wrap: wrap; }
+.tp-toggle { background: transparent; border: none; cursor: pointer; font-size: 14px; color: var(--ink-2); padding: 2px 4px; line-height: 1; }
+.tp-title { font-weight: 650; font-stretch: 85%; margin-right: 2px; }
+.tp-sets { display: flex; gap: 6px; flex-wrap: wrap; }
+.tp-chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--rule); background: transparent; color: inherit; border-radius: 12px; padding: 2px 9px; font-size: 12px; cursor: pointer; user-select: none; }
+.tp-chip.active { background: var(--pencil); border-color: var(--pencil); color: var(--pencil-ink); }
+.tp-search { flex: 1; min-width: 120px; padding: 5px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--paper); font-size: 13px; }
+.tp-count { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.tp-colwrap { position: relative; }
+.tp-colmenu { position: absolute; right: 0; top: 100%; z-index: 5; background: var(--sheet); border: 1px solid var(--rule); border-radius: 4px; padding: 8px; max-height: 260px; overflow-y: auto; width: 230px; box-shadow: 0 4px 14px rgba(0,0,0,0.18); }
+.tp-colmenu label { display: flex; gap: 6px; align-items: center; font-size: 13px; padding: 3px 0; font-weight: 400; }
+.tp-colmenu[hidden] { display: none; }
+.table-panel.minimized .tp-body { display: none; }
+.tp-body { display: flex; flex-direction: column; min-height: 0; max-height: 42vh; }
+.tp-scroll { overflow: auto; flex: 1; min-height: 0; border-top: 1px solid var(--rule); }
+#tpTable { border-collapse: collapse; width: 100%; font-size: 13px; }
+#tpTable th, #tpTable td { border-bottom: 1px solid var(--rule); padding: 5px 12px 5px 0; padding-left: 10px; text-align: left; white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+#tpTable th { cursor: pointer; position: sticky; top: 0; background: var(--sheet); user-select: none; }
+#tpTable th.sorted::after { content: ' \25B4'; }
+#tpTable th.sorted.desc::after { content: ' \25BE'; }
+#tpTable tbody tr:hover { background: var(--paper); }
+.tp-pager { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-top: 1px solid var(--rule); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -221,6 +248,28 @@ dialog::backdrop { background: rgba(20, 24, 28, 0.45); }
     <div id="apsViewer"></div>
   </section>
 </main>
+
+<section class="table-panel" id="tablePanel" hidden>
+  <div class="tp-bar">
+    <button class="tp-toggle" id="tpToggle" type="button" title="Minimize/expand">▾</button>
+    <span class="tp-title">Table</span>
+    <div class="tp-sets" id="tpSets"></div>
+    <input id="tpSearch" class="tp-search" placeholder="Filter rows…" aria-label="Filter table rows">
+    <div class="tp-colwrap">
+      <button class="btn" id="tpColsBtn" type="button">Columns</button>
+      <div class="tp-colmenu" id="tpColMenu" hidden></div>
+    </div>
+    <span class="tp-count" id="tpCount"></span>
+  </div>
+  <div class="tp-body" id="tpBodyWrap">
+    <div class="tp-scroll"><table id="tpTable"><thead id="tpThead"></thead><tbody id="tpTbody"></tbody></table></div>
+    <div class="tp-pager">
+      <button class="btn" id="tpPrevBtn" type="button">◀ Prev</button>
+      <span id="tpPageInfo"></span>
+      <button class="btn" id="tpNextBtn" type="button">Next ▶</button>
+    </div>
+  </div>
+</section>
 
 <dialog id="settings">
   <div class="dlg">
@@ -517,9 +566,171 @@ function describeSet(s) {
 
 function renderSets() {
   const el = $('sets');
-  if (!sets.size) { el.textContent = ''; return; }
-  el.textContent = 'Held in this tab: ' + [...sets.values()].map(s => `${s.id} (${s.rows.length} ${s.label})`).join(', ');
+  el.textContent = sets.size ? 'Held in this tab: ' + [...sets.values()].map(s => `${s.id} (${s.rows.length} ${s.label})`).join(', ') : '';
+  if (!$('tablePanel').hidden) tpRender();
 }
+
+/* ============================================================
+   Table panel: browse full result sets without spending chat
+   tokens on them. Auto-opens expanded on the first set created,
+   then stays wherever the user leaves it (minimized/expanded).
+   ============================================================ */
+const tablePanel = {
+  everShown: false,
+  minimized: false,
+  activeSetIds: new Set(),
+  search: '',
+  sortCol: null,
+  sortDir: 1,
+  page: 0,
+  pageSize: 100,
+  visibleCols: null
+};
+
+function tpCombinedRows() {
+  const active = [...tablePanel.activeSetIds].filter(id => sets.has(id));
+  const multi = active.length > 1;
+  const rows = [];
+  for (const id of active) {
+    const s = sets.get(id);
+    for (const r of s.rows) rows.push(multi ? { ...r, __set: s.id } : r);
+  }
+  return { rows, multi };
+}
+
+function tpDefaultColumns(rows) {
+  return propertyStats(rows).map(([k]) => k).filter(k => k !== 'External ID').slice(0, 8);
+}
+
+function tpRenderSetChips() {
+  const el = $('tpSets');
+  el.innerHTML = '';
+  for (const s of sets.values()) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'tp-chip' + (tablePanel.activeSetIds.has(s.id) ? ' active' : '');
+    chip.textContent = `${s.id} (${s.rows.length} ${s.label})`;
+    chip.onclick = () => {
+      if (tablePanel.activeSetIds.has(s.id)) tablePanel.activeSetIds.delete(s.id);
+      else tablePanel.activeSetIds.add(s.id);
+      tablePanel.page = 0;
+      tablePanel.visibleCols = null;
+      tpRender();
+    };
+    el.appendChild(chip);
+  }
+}
+
+function tpRenderColumnMenu(allCols) {
+  const menu = $('tpColMenu');
+  menu.innerHTML = '';
+  for (const c of allCols) {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = tablePanel.visibleCols.has(c);
+    cb.onchange = () => {
+      if (cb.checked) tablePanel.visibleCols.add(c); else tablePanel.visibleCols.delete(c);
+      tpRenderTable();
+    };
+    label.append(cb, document.createTextNode(' ' + c));
+    menu.appendChild(label);
+  }
+}
+
+function tpFilteredSortedRows(rows, cols, multi) {
+  let out = rows;
+  const q = tablePanel.search.trim().toLowerCase();
+  if (q) {
+    out = out.filter(r =>
+      r.name?.toLowerCase().includes(q) ||
+      (multi && r.__set?.toLowerCase().includes(q)) ||
+      cols.some(c => { const v = r.props[c]; return v != null && String(v).toLowerCase().includes(q); })
+    );
+  }
+  if (tablePanel.sortCol) {
+    const col = tablePanel.sortCol, dir = tablePanel.sortDir;
+    const val = r => col === 'name' ? r.name : col === '__set' ? r.__set : r.props[col];
+    out = [...out].sort((a, b) => {
+      const av = val(a), bv = val(b), an = num(av), bn = num(bv);
+      const cmp = (an != null && bn != null) ? an - bn : String(av ?? '').localeCompare(String(bv ?? ''));
+      return cmp * dir;
+    });
+  }
+  return out;
+}
+
+function tpRenderTable() {
+  const { rows, multi } = tpCombinedRows();
+  const allCols = propertyStats(rows).map(([k]) => k);
+  if (!tablePanel.visibleCols) tablePanel.visibleCols = new Set(tpDefaultColumns(rows));
+  const cols = allCols.filter(c => tablePanel.visibleCols.has(c));
+  const filtered = tpFilteredSortedRows(rows, cols, multi);
+  const headCols = ['name', ...(multi ? ['__set'] : []), ...cols];
+
+  const thead = $('tpThead'), tbody = $('tpTbody');
+  thead.innerHTML = '<tr>' + headCols.map(c => {
+    const label = c === '__set' ? 'Source Set' : c === 'name' ? 'Name' : c;
+    const sorted = tablePanel.sortCol === c;
+    return `<th data-col="${esc(c)}" class="${sorted ? 'sorted' + (tablePanel.sortDir < 0 ? ' desc' : '') : ''}">${esc(label)}</th>`;
+  }).join('') + '</tr>';
+  thead.querySelectorAll('th').forEach(th => {
+    th.onclick = () => {
+      const c = th.dataset.col;
+      if (tablePanel.sortCol === c) tablePanel.sortDir *= -1;
+      else { tablePanel.sortCol = c; tablePanel.sortDir = 1; }
+      tablePanel.page = 0;
+      tpRenderTable();
+    };
+  });
+
+  const pages = Math.max(1, Math.ceil(filtered.length / tablePanel.pageSize));
+  tablePanel.page = Math.min(tablePanel.page, pages - 1);
+  const start = tablePanel.page * tablePanel.pageSize;
+  const page = filtered.slice(start, start + tablePanel.pageSize);
+  tbody.innerHTML = page.map(r => '<tr>' + headCols.map(c => {
+    const v = c === 'name' ? r.name : c === '__set' ? r.__set : r.props[c];
+    return `<td title="${esc(v ?? '')}">${esc(cell(v))}</td>`;
+  }).join('') + '</tr>').join('');
+
+  $('tpCount').textContent = `${filtered.length.toLocaleString()} of ${rows.length.toLocaleString()} rows` + (filtered.length !== rows.length ? ' (filtered)' : '');
+  $('tpPageInfo').textContent = `Page ${tablePanel.page + 1} of ${pages}`;
+  $('tpPrevBtn').disabled = tablePanel.page <= 0;
+  $('tpNextBtn').disabled = tablePanel.page >= pages - 1;
+
+  tpRenderColumnMenu(allCols);
+}
+
+function tpRender() {
+  tpRenderSetChips();
+  tpRenderTable();
+}
+
+function tpShow(setId) {
+  const panel = $('tablePanel');
+  panel.hidden = false;
+  if (setId) tablePanel.activeSetIds = new Set([setId]);
+  tablePanel.page = 0;
+  tablePanel.sortCol = null;
+  tablePanel.visibleCols = null;
+  if (!tablePanel.everShown) { tablePanel.minimized = false; tablePanel.everShown = true; }
+  panel.classList.toggle('minimized', tablePanel.minimized);
+  $('tpToggle').textContent = tablePanel.minimized ? '▸' : '▾';
+  tpRender();
+}
+
+$('tpToggle').onclick = () => {
+  tablePanel.minimized = !tablePanel.minimized;
+  $('tablePanel').classList.toggle('minimized', tablePanel.minimized);
+  $('tpToggle').textContent = tablePanel.minimized ? '▸' : '▾';
+};
+$('tpSearch').addEventListener('input', e => { tablePanel.search = e.target.value; tablePanel.page = 0; tpRenderTable(); });
+$('tpColsBtn').onclick = () => { $('tpColMenu').hidden = !$('tpColMenu').hidden; };
+document.addEventListener('click', e => {
+  if (!$('tpColMenu').hidden && !e.target.closest('.tp-colwrap')) $('tpColMenu').hidden = true;
+});
+$('tpPrevBtn').onclick = () => { if (tablePanel.page > 0) { tablePanel.page--; tpRenderTable(); } };
+$('tpNextBtn').onclick = () => { tablePanel.page++; tpRenderTable(); };
 
 /* ============================================================
    Viewer
@@ -623,6 +834,18 @@ const TOOLS = [
         maxElements: { type: 'integer', description: `Cap on elements fetched. Default ${CONFIG.defaultMaxElements}.` }
       },
       required: ['elementGroupId']
+    }
+  },
+  {
+    name: 'combine_sets',
+    description: "Merge two or more existing result sets into one new result set, tagging each row with a 'Source Set' property naming where it came from. Use this to bring together results queried separately - e.g. the same category queried once per model when covering a whole project - into a single set for summarize_set, get_rows, highlight_elements, or the table view.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        setIds: { type: 'array', items: { type: 'string' }, description: 'Two or more existing result set ids to merge, e.g. from separate query_elements calls.' },
+        label: { type: 'string', description: 'Label for the combined set, e.g. "sheets". Defaults to the source sets\' labels.' }
+      },
+      required: ['setIds']
     }
   },
   {
@@ -743,7 +966,22 @@ const TOOL_IMPL = {
       label: (category || 'elements').toLowerCase(),
       truncated: r.truncated
     });
+    tpShow(s.id);
     return { text: describeSet(s), rawChars: r.rawChars };
+  },
+
+  async combine_sets({ setIds, label }) {
+    if (!Array.isArray(setIds) || setIds.length < 2) throw new Error('Provide two or more set ids to combine.');
+    const sources = setIds.map(getSet);
+    const rows = sources.flatMap(s => s.rows.map(r => ({ ...r, props: { ...r.props, 'Source Set': `${s.id} (${s.source})` } })));
+    if (!rows.length) return { text: 'The sets to combine have no rows.' };
+    const s = makeSet(rows, {
+      source: `combined from ${setIds.join(', ')}`,
+      label: label || [...new Set(sources.map(x => x.label))].join('/'),
+      truncated: sources.some(x => x.truncated)
+    });
+    tpShow(s.id);
+    return { text: describeSet(s) };
   },
 
   async summarize_set({ setId, groupBy, measure }) {
@@ -835,6 +1073,8 @@ Navigation: get_hubs, then get_projects, then get_element_groups. If the user na
 Element data: query_elements stores full results in the user's browser as a result set (set_1, set_2, ...) and gives you only a summary. Work with sets through summarize_set for counts and totals, filter_set to narrow, and get_rows only when individual elements matter. Never page through a whole large set with get_rows. If a set is marked truncated, say so when reporting totals.
 
 When querying by category, query_elements defaults to instances only (scope: 'instances') - placed elements with real geometry, which is what counts, totals and viewer highlighting should be based on. Only pass scope: 'types' or 'all' when the user is specifically asking about family types, type catalogs, or wants both together; say so if you switch scope for that reason.
+
+For requests spanning multiple models (e.g. "all sheets in every model in this project"), call query_elements once per element group, then combine_sets to merge the resulting sets into one for summarize_set/get_rows/highlight_elements. Every set query_elements or combine_sets creates also opens a browsable table in the page (below the chat) with sorting, filtering, column choice and paging over the full rows, so don't try to list many rows yourself in chat - point the user at the table instead ("I've opened set_N in the table below") and use summarize_set/get_rows only for what you need to reason about or report on directly.
 
 Viewer: render_model takes the fileVersionUrn from get_element_groups. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
 
