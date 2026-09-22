@@ -683,17 +683,21 @@ const TOOLS = [
 ];
 
 const toTsv = (header, rows) => [header.join('\t'), ...rows.map(r => r.map(cell).join('\t'))].join('\n');
+// IDs and URNs are opaque tokens fed back into later tool calls, so unlike
+// display values they must never be truncated - only made tab/newline-safe.
+const idCell = v => v == null ? '' : String(v).replace(/[\t\r\n]+/g, ' ');
+const toTsvIds = (header, rows) => [header.join('\t'), ...rows.map(r => r.map(idCell).join('\t'))].join('\n');
 
 const TOOL_IMPL = {
   async get_hubs() {
     const r = await gqlAll(Q_HUBS, {}, 'hubs', 500);
-    return { text: toTsv(['name', 'id'], r.items.map(h => [h.name, h.id])), rawChars: r.rawChars };
+    return { text: toTsvIds(['name', 'id'], r.items.map(h => [h.name, h.id])), rawChars: r.rawChars };
   },
 
   async get_projects({ hubId }) {
     const r = await gqlAll(Q_PROJECTS, { hubId }, 'projects', 1000);
     const shown = r.items.slice(0, 300);
-    let text = toTsv(['name', 'id'], shown.map(p => [p.name, p.id]));
+    let text = toTsvIds(['name', 'id'], shown.map(p => [p.name, p.id]));
     if (r.items.length > shown.length) text += `\n(${r.items.length - shown.length} more projects not shown)`;
     return { text, rawChars: r.rawChars };
   },
@@ -701,7 +705,7 @@ const TOOL_IMPL = {
   async get_element_groups({ projectId }) {
     const r = await gqlAll(Q_ELEMENT_GROUPS, { projectId }, 'elementGroupsByProject', 1000);
     const text = r.items.length
-      ? toTsv(['name', 'id', 'fileVersionUrn'], r.items.map(g => [g.name, g.id, g.alternativeIdentifiers?.fileVersionUrn]))
+      ? toTsvIds(['name', 'id', 'fileVersionUrn'], r.items.map(g => [g.name, g.id, g.alternativeIdentifiers?.fileVersionUrn]))
       : 'No element groups in this project. The AEC Data Model only covers Revit files uploaded after the project was enabled for it.';
     return { text, rawChars: r.rawChars };
   },
