@@ -259,6 +259,7 @@ dialog::backdrop { background: rgba(20, 24, 28, 0.45); }
       <button class="btn" id="tpColsBtn" type="button">Columns</button>
       <div class="tp-colmenu" id="tpColMenu" hidden></div>
     </div>
+    <button class="btn" id="tpExportBtn" type="button">Export CSV</button>
     <span class="tp-count" id="tpCount"></span>
   </div>
   <div class="tp-body" id="tpBodyWrap">
@@ -697,8 +698,48 @@ function tpRenderTable() {
   $('tpPageInfo').textContent = `Page ${tablePanel.page + 1} of ${pages}`;
   $('tpPrevBtn').disabled = tablePanel.page <= 0;
   $('tpNextBtn').disabled = tablePanel.page >= pages - 1;
+  $('tpExportBtn').disabled = !filtered.length;
 
   tpRenderColumnMenu(allCols);
+}
+
+// Full values, not truncated like cell() - CSV export shouldn't lose data.
+const csvField = v => {
+  const s = v == null ? '' : String(v).replace(/[\t\r\n]+/g, ' ');
+  return /[",]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+};
+const toCsv = (header, rows) => [header, ...rows].map(r => r.map(csvField).join(',')).join('\r\n');
+
+function tpExportFilename() {
+  const ids = [...tablePanel.activeSetIds].filter(id => sets.has(id));
+  if (!ids.length) return 'export.csv';
+  if (ids.length > 1) return `combined_${ids.join('-')}.csv`;
+  const s = sets.get(ids[0]);
+  const label = String(s.label || 'elements').replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'elements';
+  return `${s.id}_${label}.csv`;
+}
+
+function tpExportCsv() {
+  const { rows, multi } = tpCombinedRows();
+  if (!rows.length) return;
+  const allCols = propertyStats(rows).map(([k]) => k);
+  if (!tablePanel.visibleCols) tablePanel.visibleCols = new Set(tpDefaultColumns(rows));
+  const cols = allCols.filter(c => tablePanel.visibleCols.has(c));
+  const filtered = tpFilteredSortedRows(rows, cols, multi);
+  if (!filtered.length) return;
+  const headCols = ['name', ...(multi ? ['__set'] : []), ...cols];
+  const header = headCols.map(c => c === '__set' ? 'Source Set' : c === 'name' ? 'Name' : c);
+  const body = filtered.map(r => headCols.map(c => c === 'name' ? r.name : c === '__set' ? r.__set : r.props[c]));
+  // BOM so Excel opens the UTF-8 file without mangling non-ASCII text.
+  const blob = new Blob(['﻿' + toCsv(header, body)], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = tpExportFilename();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 function tpRender() {
@@ -726,6 +767,7 @@ $('tpToggle').onclick = () => {
 };
 $('tpSearch').addEventListener('input', e => { tablePanel.search = e.target.value; tablePanel.page = 0; tpRenderTable(); });
 $('tpColsBtn').onclick = () => { $('tpColMenu').hidden = !$('tpColMenu').hidden; };
+$('tpExportBtn').onclick = tpExportCsv;
 document.addEventListener('click', e => {
   if (!$('tpColMenu').hidden && !e.target.closest('.tp-colwrap')) $('tpColMenu').hidden = true;
 });
