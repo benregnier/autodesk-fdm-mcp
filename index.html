@@ -574,7 +574,14 @@ async function renderModel(fileVersionUrn) {
 
 async function isolateByExternalIds(ids) {
   if (!viewer?.model) throw new Error('No model is open in the viewer. Call render_model first.');
-  const map = await new Promise((res, rej) => viewer.model.getExternalIdMapping(res, rej));
+  const model = viewer.model;
+  const map = await Promise.race([
+    new Promise((res, rej) => model.getExternalIdMapping(res, rej)),
+    new Promise((_, rej) => setTimeout(
+      () => rej(new Error('Timed out building the External ID mapping for the open model. The property database may still be streaming in for a large model; try again in a moment.')),
+      30000
+    ))
+  ]);
   const dbids = ids.map(i => map[i]).filter(x => x != null);
   viewer.isolate(dbids);
   viewer.fitToView(dbids);
@@ -609,7 +616,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         elementGroupId: { type: 'string' },
-        category: { type: 'string', description: "Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the RSQL filter 'property.name.category'=='<category>' and 'property.name.Element Context'=='Instance' (instances only; the AEC Data Model API does not reliably match plain category filters without also constraining Element Context)." },
+        category: { type: 'string', description: "Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the RSQL filter 'property.name.category'=='<category>'." },
         filter: { type: 'string', description: 'Raw AEC Data Model filter query. Use instead of category for other filters.' },
         propertyNames: { type: 'array', items: { type: 'string' }, description: 'Only fetch these properties (External ID is always added). Omit to fetch all properties, which is heavier but lets you discover what exists.' },
         maxElements: { type: 'integer', description: `Cap on elements fetched. Default ${CONFIG.defaultMaxElements}.` }
@@ -712,7 +719,7 @@ const TOOL_IMPL = {
 
   async query_elements({ elementGroupId, category, filter, propertyNames, maxElements }) {
     const query = filter || (category
-      ? `'property.name.category'=='${String(category).replace(/'/g, "\\'")}' and 'property.name.Element Context'=='Instance'`
+      ? `'property.name.category'=='${String(category).replace(/'/g, "\\'")}'`
       : null);
     if (!query) throw new Error('Provide a category or a filter.');
     const cap = Math.max(1, Math.min(maxElements || CONFIG.defaultMaxElements, 20000));
