@@ -557,8 +557,11 @@ function describeSet(s) {
   });
   const sampleCols = stats.filter(([k]) => k !== 'External ID').slice(0, 6).map(([k]) => k);
   const sample = s.rows.slice(0, 5).map(r => [r.name, ...sampleCols.map(c => r.props[c])].map(cell).join('\t'));
+  const modelLine = s.models?.length ? ` Models (${s.models.length}): ${s.models.join(', ')}.`
+    : s.model ? ` Model: ${s.model}.`
+    : '';
   return [
-    `${s.id}: ${s.rows.length} elements. Source: ${s.source}.${s.truncated ? ' TRUNCATED at the element cap; more elements exist.' : ''}`,
+    `${s.id}: ${s.rows.length} elements.${modelLine} Source: ${s.source}.${s.truncated ? ' TRUNCATED at the element cap; more elements exist.' : ''}`,
     `Properties [filled count, kind]: ${propLines.join('; ')}${stats.length > 60 ? `; plus ${stats.length - 60} more` : ''}`,
     `Sample (first ${sample.length}), tab-separated:`,
     ['name', ...sampleCols].join('\t'),
@@ -601,8 +604,12 @@ function tpCombinedRows() {
 }
 
 function tpDefaultColumns(rows) {
-  return propertyStats(rows).map(([k]) => k).filter(k => k !== 'External ID').slice(0, 8);
+  const ranked = propertyStats(rows).map(([k]) => k).filter(k => k !== 'External ID' && k !== 'Model');
+  const hasModel = rows.some(r => r.props.Model != null);
+  return hasModel ? ['Model', ...ranked.slice(0, 7)] : ranked.slice(0, 8);
 }
+
+const shortLabel = (s, max = 22) => s.length > max ? s.slice(0, max - 1) + '…' : s;
 
 function tpRenderSetChips() {
   const el = $('tpSets');
@@ -611,7 +618,9 @@ function tpRenderSetChips() {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'tp-chip' + (tablePanel.activeSetIds.has(s.id) ? ' active' : '');
-    chip.textContent = `${s.id} (${s.rows.length} ${s.label})`;
+    const modelBadge = s.models?.length ? ` · ${s.models.length} models` : s.model ? ` · ${shortLabel(s.model)}` : '';
+    chip.textContent = `${s.id}${modelBadge} (${s.rows.length} ${s.label})`;
+    chip.title = s.models?.length ? `Models: ${s.models.join(', ')}` : s.model || '';
     chip.onclick = () => {
       if (tablePanel.activeSetIds.has(s.id)) tablePanel.activeSetIds.delete(s.id);
       else tablePanel.activeSetIds.add(s.id);
@@ -870,6 +879,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         elementGroupId: { type: 'string' },
+        modelName: { type: 'string', description: "The model's name, from get_element_groups. Always pass this when a request touches more than one model (e.g. querying a category across every model in a project) - it's stored as a 'Model' property on every row and as metadata on the set, so results stay attributable to the right model once queried sets are combined or compared. Falls back to elementGroupId if omitted, which is unambiguous but not human-readable." },
         category: { type: 'string', description: "Revit category, e.g. Walls, Doors, Windows, Floors, Furniture, Ceilings, Rooms, Electrical Equipment. Builds the RSQL filter 'property.name.category'=='<category>', scoped by 'scope' (instances only by default)." },
         filter: { type: 'string', description: 'Raw AEC Data Model filter query. Use instead of category for other filters. Not scoped automatically - include your own Element Context clause if you need to restrict to instances or types.' },
         scope: { type: 'string', enum: ['instances', 'types', 'all'], description: "Only applies with 'category'. 'instances' (default) returns placed instances only, via 'property.name.Element Context'=='Instance' - the right choice for counts, totals, and anything highlighted in the viewer, since Type rows have no 3D geometry. 'types' returns only Type-level rows (family types/type catalog entries) for questions about type definitions. 'all' returns both instance and type rows together." },
@@ -881,7 +891,7 @@ const TOOLS = [
   },
   {
     name: 'combine_sets',
-    description: "Merge two or more existing result sets into one new result set, tagging each row with a 'Source Set' property naming where it came from. Use this to bring together results queried separately - e.g. the same category queried once per model when covering a whole project - into a single set for summarize_set, get_rows, highlight_elements, or the table view.",
+    description: "Merge two or more existing result sets into one new result set. Each row already carries the 'Model' property it was tagged with by query_elements (see that tool's modelName argument), so combined rows stay attributable to their originating model; rows also get a 'Source Set' property naming the exact set/query they came from. Use this to bring together results queried separately - e.g. the same category queried once per model when covering a whole project - into a single set for summarize_set, get_rows, highlight_elements, or the table view.",
     input_schema: {
       type: 'object',
       properties: {
@@ -984,7 +994,7 @@ const TOOL_IMPL = {
     return { text, rawChars: r.rawChars };
   },
 
-  async query_elements({ elementGroupId, category, filter, scope, propertyNames, maxElements }) {
+  async query_elements({ elementGroupId, modelName, category, filter, scope, propertyNames, maxElements }) {
     let query = filter;
     if (!query && category) {
       const catClause = `'property.name.category'=='${String(category).replace(/'/g, "\\'")}'`;
@@ -998,8 +1008,9 @@ const TOOL_IMPL = {
     const names = propertyNames?.length ? [...new Set([...propertyNames, 'External ID'])] : null;
     const vars = { elementGroupId, filter: query, limit: CONFIG.elementPageSize, ...(names ? { names } : {}) };
     const r = await gqlAll(names ? Q_ELEMENTS_SOME_PROPS : Q_ELEMENTS_ALL_PROPS, vars, 'elementsByElementGroup', cap);
+    const model = modelName || elementGroupId;
     const rows = r.items.map(e => {
-      const props = {};
+      const props = { Model: model };
       for (const p of e.properties?.results || []) props[p.name] = p.value;
       return { id: e.id, name: e.name, externalId: props['External ID'] ?? null, props };
     });
@@ -1007,7 +1018,8 @@ const TOOL_IMPL = {
     const s = makeSet(rows, {
       source: `filter "${query}" on element group ${elementGroupId}`,
       label: (category || 'elements').toLowerCase(),
-      truncated: r.truncated
+      truncated: r.truncated,
+      model
     });
     tpShow(s.id);
     return { text: describeSet(s), rawChars: r.rawChars };
@@ -1018,10 +1030,12 @@ const TOOL_IMPL = {
     const sources = setIds.map(getSet);
     const rows = sources.flatMap(s => s.rows.map(r => ({ ...r, props: { ...r.props, 'Source Set': `${s.id} (${s.source})` } })));
     if (!rows.length) return { text: 'The sets to combine have no rows.' };
+    const models = [...new Set(sources.map(s => s.model).filter(Boolean))];
     const s = makeSet(rows, {
       source: `combined from ${setIds.join(', ')}`,
       label: label || [...new Set(sources.map(x => x.label))].join('/'),
-      truncated: sources.some(x => x.truncated)
+      truncated: sources.some(x => x.truncated),
+      models
     });
     tpShow(s.id);
     return { text: describeSet(s) };
@@ -1069,7 +1083,13 @@ const TOOL_IMPL = {
     if (!test) throw new Error(`Unknown op "${op}".`);
     const rows = s.rows.filter(r => test(get(r)));
     if (!rows.length) return { text: `No elements in ${s.id} where ${property} ${op} ${value ?? ''}.` };
-    const n = makeSet(rows, { source: `${s.id} where ${property} ${op} ${value ?? ''}`, label: s.label, truncated: s.truncated });
+    const n = makeSet(rows, {
+      source: `${s.id} where ${property} ${op} ${value ?? ''}`,
+      label: s.label,
+      truncated: s.truncated,
+      model: s.model,
+      models: s.models
+    });
     return { text: describeSet(n) };
   },
 
@@ -1117,7 +1137,7 @@ Element data: query_elements stores full results in the user's browser as a resu
 
 When querying by category, query_elements defaults to instances only (scope: 'instances') - placed elements with real geometry, which is what counts, totals and viewer highlighting should be based on. Only pass scope: 'types' or 'all' when the user is specifically asking about family types, type catalogs, or wants both together; say so if you switch scope for that reason.
 
-For requests spanning multiple models (e.g. "all sheets in every model in this project"), call query_elements once per element group, then combine_sets to merge the resulting sets into one for summarize_set/get_rows/highlight_elements. Every set query_elements or combine_sets creates also opens a browsable table in the page (below the chat) with sorting, filtering, column choice and paging over the full rows, so don't try to list many rows yourself in chat - point the user at the table instead ("I've opened set_N in the table below") and use summarize_set/get_rows only for what you need to reason about or report on directly.
+For requests spanning multiple models (e.g. "all sheets in every model in this project"), call query_elements once per element group - always pass modelName (the name get_element_groups gave that element group), every time, not just when it seems useful - then combine_sets to merge the resulting sets into one for summarize_set/get_rows/highlight_elements. This is what keeps combined results attributable: every row carries a 'Model' column throughout, so counts, filters and exports can always be broken down or checked by model, and querying the same request again gives the same attribution rather than depending on whether you remembered to pass modelName that time. Every set query_elements or combine_sets creates also opens a browsable table in the page (below the chat) with sorting, filtering, column choice and paging over the full rows, so don't try to list many rows yourself in chat - point the user at the table instead ("I've opened set_N in the table below") and use summarize_set/get_rows only for what you need to reason about or report on directly.
 
 Viewer: render_model takes the fileVersionUrn from get_element_groups. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
 
