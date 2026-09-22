@@ -401,7 +401,7 @@ async function gql(query, variables = {}) {
   try { j = JSON.parse(text); } catch {}
   if (res.status === 401) throw new Error('Autodesk rejected the token (401). Sign in again.');
   if (!j) throw new Error(`AEC Data Model API returned ${res.status}: ${text.slice(0, 200)}`);
-  if (j.errors?.length && !j.data) throw new Error(j.errors.map(e => e.message).join('; '));
+  if (j.errors?.length) throw new Error(j.errors.map(e => e.message).join('; '));
   return { data: j.data, rawChars: text.length };
 }
 
