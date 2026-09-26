@@ -15,6 +15,8 @@
 
   The Anthropic key lives in sessionStorage for this tab only. The client ID, region and
   model choice live in localStorage. Nothing is sent anywhere except Autodesk and Anthropic.
+  Reading PDFs or spreadsheets from ACC Docs loads pdf-lib or SheetJS from cdn.jsdelivr.net
+  the first time, and parses the file in this tab.
 -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -322,7 +324,12 @@ const CONFIG = {
   defaultModel: 'claude-sonnet-5',
   maxAgentSteps: 15,       // Upper bound on tool-use round trips per message
   elementPageSize: 100,    // GraphQL page size for element queries
-  defaultMaxElements: 2000 // Default cap on elements fetched per query
+  defaultMaxElements: 2000, // Default cap on elements fetched per query
+  defaultPdfPages: 10,     // Pages sent to Claude when read_pdf is not given a range
+  maxPdfPages: 30,         // Upper bound on pages per read_pdf call
+  maxPdfSendBytes: 24e6,   // Keeps a read_pdf request under the API's request size limit
+  maxDownloadBytes: 200e6, // Largest file the page will download
+  maxSheetRows: 20000      // Cap on rows loaded from one worksheet
 };
 const AUTH_URL = 'https://developer.api.autodesk.com/authentication/v2/authorize';
 const TOKEN_URL = 'https://developer.api.autodesk.com/authentication/v2/token';
@@ -512,6 +519,201 @@ query ($elementGroupId: ID!, $filter: String!, $cursor: String, $limit: Int, $na
 }`;
 
 /* ============================================================
+   ACC Docs files: Data Management + OSS REST APIs
+   ============================================================ */
+const APS_URL = 'https://developer.api.autodesk.com';
+
+async function aps(pathOrUrl) {
+  const token = await getApsToken();
+  const url = pathOrUrl.startsWith('http') ? pathOrUrl : APS_URL + pathOrUrl;
+  let res;
+  try {
+    res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  } catch {
+    throw new Error('The browser could not reach the Autodesk Data Management API. If the network is fine, the request was probably blocked by CORS; the browser console will say.');
+  }
+  const text = await res.text();
+  let j = null;
+  try { j = JSON.parse(text); } catch {}
+  if (res.status === 401) throw new Error('Autodesk rejected the token (401). Sign in again.');
+  if (res.status === 403) throw new Error('Autodesk returned 403: the signed-in user has no access to this project, folder or file.');
+  if (!res.ok || !j) {
+    const detail = j?.errors?.map(e => e.detail || e.title).join('; ') || j?.reason || j?.developerMessage || text.slice(0, 200);
+    throw new Error(`Autodesk API returned ${res.status}: ${detail}`);
+  }
+  return { json: j, rawChars: text.length };
+}
+
+// JSON:API pagination: follows links.next until done or maxItems is reached.
+async function apsAll(path, maxItems) {
+  const data = [], included = [];
+  let next = path, rawChars = 0, pages = 0;
+  while (next && data.length < maxItems && pages < 100) {
+    const { json, rawChars: n } = await aps(next);
+    rawChars += n;
+    data.push(...(json.data || []));
+    included.push(...(json.included || []));
+    next = json.links?.next?.href || null;
+    pages++;
+  }
+  return { data: data.slice(0, maxItems), included, truncated: !!next || data.length > maxItems, rawChars };
+}
+
+// The file tools take the same project ids as the GraphQL tools; the Data
+// Management API wants its own "b." ids, so they're resolved once and cached.
+const Q_PROJECT_DM_IDS = `
+query ($projectId: ID!) {
+  project(projectId: $projectId) {
+    alternativeIdentifiers { dataManagementAPIProjectId }
+    hub { alternativeIdentifiers { dataManagementAPIHubId } }
+  }
+}`;
+const dmIdCache = new Map();
+
+async function resolveDmIds(projectId) {
+  if (dmIdCache.has(projectId)) return dmIdCache.get(projectId);
+  let dmProjectId = projectId.startsWith('b.') ? projectId : null, dmHubId = null;
+  if (!dmProjectId) {
+    const { data } = await gql(Q_PROJECT_DM_IDS, { projectId });
+    dmProjectId = data?.project?.alternativeIdentifiers?.dataManagementAPIProjectId;
+    dmHubId = data?.project?.hub?.alternativeIdentifiers?.dataManagementAPIHubId || null;
+    if (!dmProjectId) throw new Error(`Could not find Data Management ids for project ${projectId}.`);
+  }
+  if (!dmHubId) {
+    // Only reached with a raw "b." project id: find the hub that holds it.
+    const { json } = await aps('/project/v1/hubs');
+    for (const h of json.data || []) {
+      try { await aps(`/project/v1/hubs/${encodeURIComponent(h.id)}/projects/${encodeURIComponent(dmProjectId)}`); dmHubId = h.id; break; }
+      catch {}
+    }
+    if (!dmHubId) throw new Error(`No hub the user can access contains project ${dmProjectId}.`);
+  }
+  const ids = { hubId: dmHubId, projectId: dmProjectId };
+  dmIdCache.set(projectId, ids);
+  return ids;
+}
+
+const fileExt = name => (String(name).match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
+
+function fileRow(item, version) {
+  const va = version?.attributes || {}, ia = item?.attributes || {};
+  const name = va.displayName || va.name || ia.displayName || '';
+  return {
+    name,
+    ext: va.fileType || fileExt(name),
+    version: va.versionNumber ?? '',
+    size: va.storageSize ?? '',
+    modified: (va.lastModifiedTime || ia.lastModifiedTime || '').slice(0, 10),
+    modifiedBy: va.lastModifiedUserName || ia.lastModifiedUserName || '',
+    itemId: item?.id || version?.relationships?.item?.data?.id || '',
+    versionId: version?.id || '',
+    folderId: item?.relationships?.parent?.data?.id || ''
+  };
+}
+
+// Downloads keyed by version id, so a PDF can be re-read at other pages, or a
+// workbook at another sheet, without fetching it again.
+const fileCache = new Map();
+const FILE_CACHE_MAX = 6;
+
+async function getFileVersion(projectId, fileId) {
+  const { projectId: p } = await resolveDmIds(projectId);
+  const isVersion = /fs\.file:|\?version=/.test(fileId);
+  const path = isVersion
+    ? `/data/v1/projects/${encodeURIComponent(p)}/versions/${encodeURIComponent(fileId)}`
+    : `/data/v1/projects/${encodeURIComponent(p)}/items/${encodeURIComponent(fileId)}/tip`;
+  const { json } = await aps(path);
+  return json.data;
+}
+
+async function downloadFile(projectId, fileId) {
+  const version = await getFileVersion(projectId, fileId);
+  const cached = fileCache.get(version.id);
+  if (cached) return cached;
+  const a = version.attributes || {};
+  const storage = version.relationships?.storage?.data?.id || '';
+  const m = storage.match(/^urn:adsk\.objects:os\.object:([^/]+)\/(.+)$/);
+  if (!m) throw new Error(`"${a.displayName || fileId}" has no downloadable storage object (it may be a link or a cloud model rather than an uploaded file).`);
+  if (a.storageSize > CONFIG.maxDownloadBytes) throw new Error(`"${a.displayName}" is ${(a.storageSize / 1e6).toFixed(0)} MB, over the ${CONFIG.maxDownloadBytes / 1e6} MB download limit for this page.`);
+  const { json: signed } = await aps(`/oss/v2/buckets/${encodeURIComponent(m[1])}/objects/${encodeURIComponent(m[2])}/signeds3download`);
+  if (!signed.url) throw new Error(`Autodesk did not return a download URL (status: ${signed.status || 'unknown'}).`);
+  let res;
+  try { res = await fetch(signed.url); }
+  catch { throw new Error('The browser could not download the file from storage. If the network is fine, the download was probably blocked by CORS; the browser console will say.'); }
+  if (!res.ok) throw new Error(`File download failed with status ${res.status}.`);
+  const file = { name: a.displayName || a.name || 'file', versionId: version.id, versionNumber: a.versionNumber, bytes: new Uint8Array(await res.arrayBuffer()) };
+  fileCache.set(version.id, file);
+  while (fileCache.size > FILE_CACHE_MAX) fileCache.delete(fileCache.keys().next().value);
+  return file;
+}
+
+// Parsing libraries are only fetched the first time a PDF or workbook is read.
+const libs = {};
+function loadLib(src, globalName) {
+  if (!libs[globalName]) {
+    libs[globalName] = new Promise((resolve, reject) => {
+      if (window[globalName]) { resolve(window[globalName]); return; }
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => window[globalName] ? resolve(window[globalName]) : reject(new Error(`${globalName} did not load.`));
+      s.onerror = () => reject(new Error(`Could not load ${src}.`));
+      document.head.appendChild(s);
+    });
+    libs[globalName].catch(() => { delete libs[globalName]; });
+  }
+  return libs[globalName];
+}
+const loadPdfLib = () => loadLib('https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js', 'PDFLib');
+const loadSheetJs = () => loadLib('https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js', 'XLSX');
+
+// "1-3,7" -> [0,1,2,6], clamped to the document.
+function parsePageSpec(spec, total) {
+  const out = new Set();
+  for (const part of String(spec).split(',').map(s => s.trim()).filter(Boolean)) {
+    const range = part.match(/^(\d*)\s*-\s*(\d*)$/);
+    let from, to;
+    if (range) { from = range[1] ? +range[1] : 1; to = range[2] ? +range[2] : total; }
+    else if (/^\d+$/.test(part)) from = to = +part;
+    else throw new Error(`Could not read page range "${part}". Use e.g. "1-5" or "2,4,9-12".`);
+    for (let p = Math.max(1, from); p <= Math.min(total, to); p++) out.add(p - 1);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+// Compact "1-3, 7" label for a list of 0-based page indexes.
+function pageLabel(idx) {
+  const runs = [];
+  for (const i of idx) {
+    const last = runs[runs.length - 1];
+    if (last && i === last[1] + 1) last[1] = i; else runs.push([i, i]);
+  }
+  return runs.map(([a, b]) => a === b ? `${a + 1}` : `${a + 1}-${b + 1}`).join(', ');
+}
+
+function bytesToBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+// Header cells become property names: blanks get their column letter and
+// repeats get a suffix, so every column stays addressable.
+function headerNames(cells, width, XLSX) {
+  const seen = new Map();
+  return Array.from({ length: width }, (_, c) => {
+    let h = cells[c] == null ? '' : String(cells[c] instanceof Date ? cells[c].toISOString().slice(0, 10) : cells[c]).replace(/\s+/g, ' ').trim();
+    if (!h) h = `Column ${XLSX.utils.encode_col(c)}`;
+    const n = (seen.get(h) || 0) + 1;
+    seen.set(h, n);
+    return n > 1 ? `${h} (${n})` : h;
+  });
+}
+
+const cellValue = v => v instanceof Date
+  ? (v.getUTCHours() || v.getUTCMinutes() || v.getUTCSeconds() ? v.toISOString().slice(0, 19).replace('T', ' ') : v.toISOString().slice(0, 10))
+  : typeof v === 'string' ? v.trim() : v;
+
+/* ============================================================
    Result sets: full data stays here, Claude sees summaries
    ============================================================ */
 const sets = new Map();
@@ -548,6 +750,9 @@ function propertyStats(rows) {
   return [...stats.entries()].sort((a, b) => b[1].filled - a[1].filled);
 }
 
+// Bookkeeping columns every row shares; they'd crowd real data out of the sample.
+const SAMPLE_SKIP = new Set(['External ID', 'Row', 'Sheet', 'File']);
+
 function describeSet(s) {
   const stats = propertyStats(s.rows);
   const propLines = stats.slice(0, 60).map(([k, st]) => {
@@ -555,13 +760,14 @@ function describeSet(s) {
       : st.values.size <= 20 ? `${st.values.size} distinct` : 'text';
     return `${k} [${st.filled}, ${kind}]`;
   });
-  const sampleCols = stats.filter(([k]) => k !== 'External ID').slice(0, 6).map(([k]) => k);
+  const sampleCols = stats.filter(([k]) => !SAMPLE_SKIP.has(k)).slice(0, 6).map(([k]) => k);
   const sample = s.rows.slice(0, 5).map(r => [r.name, ...sampleCols.map(c => r.props[c])].map(cell).join('\t'));
   const modelLine = s.models?.length ? ` Models (${s.models.length}): ${s.models.join(', ')}.`
     : s.model ? ` Model: ${s.model}.`
+    : s.file ? ` File: ${s.file}${s.sheet ? `, sheet "${s.sheet}"` : ''}.`
     : '';
   return [
-    `${s.id}: ${s.rows.length} elements.${modelLine} Source: ${s.source}.${s.truncated ? ' TRUNCATED at the element cap; more elements exist.' : ''}`,
+    `${s.id}: ${s.rows.length} ${s.noun || 'elements'}.${modelLine} Source: ${s.source}.${s.truncated ? ' TRUNCATED at the element cap; more elements exist.' : ''}`,
     `Properties [filled count, kind]: ${propLines.join('; ')}${stats.length > 60 ? `; plus ${stats.length - 60} more` : ''}`,
     `Sample (first ${sample.length}), tab-separated:`,
     ['name', ...sampleCols].join('\t'),
@@ -604,9 +810,11 @@ function tpCombinedRows() {
 }
 
 function tpDefaultColumns(rows) {
-  const ranked = propertyStats(rows).map(([k]) => k).filter(k => k !== 'External ID' && k !== 'Model');
+  const ranked = propertyStats(rows).map(([k]) => k).filter(k => !SAMPLE_SKIP.has(k) && k !== 'Model');
   const hasModel = rows.some(r => r.props.Model != null);
-  return hasModel ? ['Model', ...ranked.slice(0, 7)] : ranked.slice(0, 8);
+  const multiFile = new Set(rows.map(r => r.props.File).filter(Boolean)).size > 1;
+  const lead = [hasModel && 'Model', multiFile && 'File'].filter(Boolean);
+  return [...lead, ...ranked.slice(0, 8 - lead.length)];
 }
 
 const shortLabel = (s, max = 22) => s.length > max ? s.slice(0, max - 1) + '…' : s;
@@ -943,8 +1151,62 @@ const TOOLS = [
     }
   },
   {
+    name: 'list_folder',
+    description: "Browse a project's ACC Docs file tree (all file types, not just Revit). Without folderId, lists the project's top folders (e.g. Project Files, Plans). With folderId, lists that folder's subfolders and files, with each file's itemId, versionId, extension, version number, size and last modified date.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        folderId: { type: 'string', description: 'Folder id from an earlier list_folder call. Omit for the top folders.' }
+      },
+      required: ['projectId']
+    }
+  },
+  {
+    name: 'search_files',
+    description: "Search a folder and all of its subfolders for files by extension and/or name. Results are stored as a result set (opened in the table below the chat) and the first rows are returned with their ids. Prefer this over walking folders one by one with list_folder.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        folderId: { type: 'string', description: 'Folder to search under, from list_folder (usually Project Files).' },
+        extensions: { type: 'array', items: { type: 'string' }, description: 'File extensions without the dot, e.g. ["pdf"] or ["xlsx","xls","csv"].' },
+        nameContains: { type: 'string', description: 'Only files whose name contains this text.' },
+        maxFiles: { type: 'integer', description: 'Cap on files returned. Default 500.' }
+      },
+      required: ['projectId', 'folderId']
+    }
+  },
+  {
+    name: 'read_pdf',
+    description: `Download a PDF from ACC Docs and read selected pages directly: text, tables, title blocks and the drawn page images. Returns the page count so you can ask for more. Pages cost tokens (roughly 1,500-3,000 each), so read only the pages the question needs; default is the first ${CONFIG.defaultPdfPages}, max ${CONFIG.maxPdfPages} per call. The pages are only visible in the turn they were read; call again later if you need them.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        fileId: { type: 'string', description: 'itemId (reads the latest version) or versionId (reads that version), from list_folder or search_files.' },
+        pages: { type: 'string', description: 'Pages to read, 1-based, e.g. "1-5" or "2,4,9-12".' }
+      },
+      required: ['projectId', 'fileId']
+    }
+  },
+  {
+    name: 'read_spreadsheet',
+    description: "Download an Excel workbook (.xlsx, .xlsm, .xls) or CSV from ACC Docs and load one worksheet as a result set, one row per spreadsheet row with the header row's cells as property names. Works with summarize_set, filter_set, get_rows, combine_sets and the table view exactly like element sets. Returns the workbook's sheet names and sizes, so call again with sheet to load another.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        fileId: { type: 'string', description: 'itemId (latest version) or versionId, from list_folder or search_files.' },
+        sheet: { type: 'string', description: 'Worksheet name. Defaults to the first sheet.' },
+        headerRow: { type: 'integer', description: "1-based row holding the column headers. Defaults to the first non-empty row; set it when a title block sits above the real headers." }
+      },
+      required: ['projectId', 'fileId']
+    }
+  },
+  {
     name: 'render_model',
-    description: 'Open a model in the Autodesk Viewer next to the chat, using the fileVersionUrn from get_element_groups.',
+    description: 'Open a file in the Autodesk Viewer next to the chat: a model using the fileVersionUrn from get_element_groups, or any viewable ACC Docs file (PDF, DWG, etc.) using the versionId from list_folder or search_files.',
     input_schema: { type: 'object', properties: { fileVersionUrn: { type: 'string' } }, required: ['fileVersionUrn'] }
   },
   {
@@ -1059,9 +1321,9 @@ const TOOL_IMPL = {
     const rows = sorted.slice(0, 80).map(([k, g]) => [k, g.count, ...(measure
       ? (g.n ? [fmt(g.sum), fmt(g.sum / g.n), fmt(g.min), fmt(g.max), g.n] : ['', '', '', '', 0])
       : [])]);
-    let text = `${s.id}, ${s.rows.length} elements${s.truncated ? ' (set is truncated)' : ''}\n` + toTsv(header, rows);
+    let text = `${s.id}, ${s.rows.length} ${s.noun || 'elements'}${s.truncated ? ' (set is truncated)' : ''}\n` + toTsv(header, rows);
     if (sorted.length > 80) text += `\n(${sorted.length - 80} smaller groups not shown)`;
-    if (measure) text += '\nValues are raw API numbers; units follow the model settings (often metric internal units).';
+    if (measure && !s.file) text += '\nValues are raw API numbers; units follow the model settings (often metric internal units).';
     return { text };
   },
 
@@ -1102,6 +1364,152 @@ const TOOL_IMPL = {
     return { text };
   },
 
+  async list_folder({ projectId, folderId }) {
+    const ids = await resolveDmIds(projectId);
+    if (!folderId) {
+      const r = await apsAll(`/project/v1/hubs/${encodeURIComponent(ids.hubId)}/projects/${encodeURIComponent(ids.projectId)}/topFolders?excludeDeleted=true`, 500);
+      const text = r.data.length
+        ? toTsvIds(['folder', 'folderId'], r.data.map(f => [f.attributes?.displayName || f.attributes?.name, f.id]))
+        : 'This project has no top folders the user can see.';
+      return { text, rawChars: r.rawChars };
+    }
+    const r = await apsAll(`/data/v1/projects/${encodeURIComponent(ids.projectId)}/folders/${encodeURIComponent(folderId)}/contents?page[limit]=200`, 2000);
+    const versions = new Map(r.included.filter(x => x.type === 'versions').map(v => [v.id, v]));
+    const folders = r.data.filter(x => x.type === 'folders');
+    const files = r.data.filter(x => x.type === 'items').map(i => fileRow(i, versions.get(i.relationships?.tip?.data?.id)));
+    const parts = [];
+    if (folders.length) parts.push(toTsvIds(['folder', 'folderId'], folders.map(f => [f.attributes?.displayName || f.attributes?.name, f.id])));
+    const shown = files.slice(0, 300);
+    if (files.length) parts.push(toTsvIds(['file', 'ext', 'version', 'bytes', 'modified', 'modifiedBy', 'itemId', 'versionId'],
+      shown.map(f => [f.name, f.ext, f.version, f.size, f.modified, f.modifiedBy, f.itemId, f.versionId])));
+    if (files.length > shown.length) parts.push(`(${files.length - shown.length} more files not shown; use search_files with an extension or name filter.)`);
+    if (r.truncated) parts.push('(Folder listing truncated.)');
+    return { text: parts.join('\n\n') || 'This folder is empty.', rawChars: r.rawChars };
+  },
+
+  async search_files({ projectId, folderId, extensions, nameContains, maxFiles }) {
+    const ids = await resolveDmIds(projectId);
+    const cap = Math.max(1, Math.min(maxFiles || 500, 5000));
+    const q = new URLSearchParams();
+    const exts = (extensions || []).map(e => String(e).replace(/^\./, '').toLowerCase()).filter(Boolean);
+    if (exts.length) q.set('filter[fileType]', exts.join(','));
+    if (nameContains) q.set('filter[attributes.displayName]-contains', nameContains);
+    const r = await apsAll(`/data/v1/projects/${encodeURIComponent(ids.projectId)}/folders/${encodeURIComponent(folderId)}/search?${q}`, cap);
+    const items = new Map(r.included.filter(x => x.type === 'items').map(i => [i.id, i]));
+    // Keep one row per file: the newest version the search returned.
+    const byItem = new Map();
+    for (const v of r.data.filter(x => x.type === 'versions')) {
+      const f = fileRow(items.get(v.relationships?.item?.data?.id), v);
+      const prev = byItem.get(f.itemId);
+      if (!prev || +f.version > +prev.version) byItem.set(f.itemId, f);
+    }
+    const files = [...byItem.values()];
+    const what = [exts.length && exts.join('/'), nameContains && `"${nameContains}"`].filter(Boolean).join(' ') || 'all';
+    if (!files.length) return { text: `No ${what} files under that folder.`, rawChars: r.rawChars };
+    const s = makeSet(files.map(f => ({
+      id: f.itemId, name: f.name, externalId: null,
+      props: { Extension: f.ext, Version: f.version, Bytes: f.size, Modified: f.modified, 'Modified By': f.modifiedBy, 'Item ID': f.itemId, 'Version ID': f.versionId, 'Folder ID': f.folderId }
+    })), { source: `file search (${what}) in folder ${folderId}`, label: 'files', noun: 'files', truncated: r.truncated });
+    tpShow(s.id);
+    const shown = files.slice(0, 50);
+    let text = `${s.id}: ${files.length} files${r.truncated ? ' (TRUNCATED; more exist)' : ''}. All rows are in the table below the chat; the first ${shown.length}:\n`
+      + toTsvIds(['file', 'ext', 'version', 'modified', 'itemId', 'versionId'], shown.map(f => [f.name, f.ext, f.version, f.modified, f.itemId, f.versionId]));
+    if (files.length > shown.length) text += `\nUse get_rows on ${s.id} with properties ["Item ID","Version ID"] to read ids of the rest, or filter_set to narrow.`;
+    return { text, rawChars: r.rawChars };
+  },
+
+  async read_pdf({ projectId, fileId, pages }) {
+    const file = await downloadFile(projectId, fileId);
+    if (!/\.pdf$/i.test(file.name) && String.fromCharCode(...file.bytes.subarray(0, 4)) !== '%PDF') {
+      throw new Error(`"${file.name}" is not a PDF.`);
+    }
+    const PDFLib = await loadPdfLib();
+    let src;
+    try { src = await PDFLib.PDFDocument.load(file.bytes, { ignoreEncryption: true }); }
+    catch (e) { throw new Error(`Could not open "${file.name}" as a PDF: ${e.message}`); }
+    const total = src.getPageCount();
+    let idx = pages ? parsePageSpec(pages, total) : [...Array(Math.min(total, CONFIG.defaultPdfPages)).keys()];
+    if (!idx.length) throw new Error(`"${file.name}" has ${total} pages; "${pages}" selects none of them.`);
+    const capped = idx.length > CONFIG.maxPdfPages;
+    if (capped) idx = idx.slice(0, CONFIG.maxPdfPages);
+    let bytes = file.bytes;
+    if (idx.length !== total && src.isEncrypted) {
+      // pdf-lib can't copy pages out of an encrypted file, but the file as a
+      // whole can still be sent if it's short enough.
+      if (total > CONFIG.maxPdfPages) throw new Error(`"${file.name}" is encrypted (${total} pages), so single pages can't be extracted, and the whole file is over the ${CONFIG.maxPdfPages}-page limit per call. Ask the user for an unprotected copy.`);
+      idx = [...Array(total).keys()];
+    }
+    if (idx.length !== total) {
+      const out = await PDFLib.PDFDocument.create();
+      for (const p of await out.copyPages(src, idx)) out.addPage(p);
+      bytes = await out.save();
+    }
+    if (bytes.length > CONFIG.maxPdfSendBytes) {
+      throw new Error(`Pages ${pageLabel(idx)} of "${file.name}" come to ${(bytes.length / 1e6).toFixed(1)} MB, over the ${CONFIG.maxPdfSendBytes / 1e6} MB that fits in one request. Read fewer pages at a time.`);
+    }
+    const text = `"${file.name}" (version ${file.versionNumber ?? '?'}), ${total} pages. Attached: page${idx.length > 1 ? 's' : ''} ${pageLabel(idx)} of ${total}.`
+      + (capped ? ` Capped at ${CONFIG.maxPdfPages} pages per call; read the rest in another call.` : '')
+      + (!pages && total > idx.length ? ` Pass pages to read others.` : '');
+    return {
+      text,
+      pdfPages: idx.length,
+      content: [
+        { type: 'text', text },
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: bytesToBase64(bytes) }, title: `${file.name} p. ${pageLabel(idx)}` }
+      ]
+    };
+  },
+
+  async read_spreadsheet({ projectId, fileId, sheet, headerRow }) {
+    const file = await downloadFile(projectId, fileId);
+    const XLSX = await loadSheetJs();
+    let wb;
+    try { wb = XLSX.read(file.bytes, { type: 'array', cellDates: true }); }
+    catch (e) { throw new Error(`Could not open "${file.name}" as a spreadsheet: ${e.message}`); }
+    const sheetInfo = wb.SheetNames.map(n => {
+      const ref = wb.Sheets[n]['!ref'];
+      const r = ref ? XLSX.utils.decode_range(ref) : null;
+      return `${n} (${r ? `${r.e.r - r.s.r + 1} rows x ${r.e.c - r.s.c + 1} cols` : 'empty'})`;
+    });
+    const sheetName = sheet ?? wb.SheetNames[0];
+    const ws = wb.Sheets[sheetName];
+    if (!ws) throw new Error(`No sheet named "${sheet}" in "${file.name}". Sheets: ${wb.SheetNames.join(', ')}.`);
+    const sheetsLine = `Workbook "${file.name}" (version ${file.versionNumber ?? '?'}) sheets: ${sheetInfo.join('; ')}.`;
+    if (!ws['!ref']) return { text: `${sheetsLine}\nSheet "${sheetName}" is empty.` };
+
+    const range = XLSX.utils.decode_range(ws['!ref']);
+    const width = range.e.c + 1;
+    // Rows as arrays from A1, so array index + 1 is the spreadsheet row number.
+    const grid = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null, blankrows: true, range: { s: { r: 0, c: 0 }, e: range.e } });
+    const filled = r => r ? r.filter(v => v != null && v !== '').length : 0;
+    const isBlank = r => !filled(r);
+    // Default header: the first of the top 20 rows that is about as full as
+    // the fullest of them, which skips title and project-info rows above it.
+    const top = grid.slice(0, 20);
+    const widest = Math.max(0, ...top.map(filled));
+    let h = headerRow ? headerRow - 1 : top.findIndex(r => filled(r) >= Math.max(1, Math.min(2, widest), Math.ceil(widest * 0.6)));
+    if (h < 0 || h >= grid.length) throw new Error(`Row ${headerRow} is outside sheet "${sheetName}" (${grid.length} rows).`);
+    const names = headerNames(grid[h] || [], width, XLSX);
+    const rows = [];
+    let truncated = false;
+    for (let i = h + 1; i < grid.length; i++) {
+      if (isBlank(grid[i])) continue;
+      if (rows.length >= CONFIG.maxSheetRows) { truncated = true; break; }
+      const props = { Row: i + 1 };
+      names.forEach((n, c) => { const v = cellValue(grid[i][c]); if (v != null && v !== '') props[n] = v; });
+      props.Sheet = sheetName;
+      props.File = file.name;
+      rows.push({ id: `${file.versionId}#${sheetName}!${i + 1}`, name: `Row ${i + 1}`, externalId: null, props });
+    }
+    if (!rows.length) return { text: `${sheetsLine}\nSheet "${sheetName}" has a header row (row ${h + 1}) but no data rows below it.` };
+    const s = makeSet(rows, {
+      source: `sheet "${sheetName}" of ${file.name}, headers from row ${h + 1}`,
+      label: 'rows', noun: 'rows', truncated, file: file.name, sheet: sheetName
+    });
+    tpShow(s.id);
+    return { text: `${sheetsLine}\nHeaders taken from row ${h + 1}: ${names.join(' | ')}\n${describeSet(s)}` };
+  },
+
   async render_model({ fileVersionUrn }) {
     return { text: await renderModel(fileVersionUrn) };
   },
@@ -1129,7 +1537,7 @@ const TOOL_IMPL = {
 /* ============================================================
    Claude agent loop
    ============================================================ */
-const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revit models in ACC) through tools, with an Autodesk Viewer shown next to the chat.
+const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revit models in ACC) and review the other files in ACC Docs (PDFs, spreadsheets) through tools, with an Autodesk Viewer shown next to the chat.
 
 Navigation: get_hubs, then get_projects, then get_element_groups. If the user names a hub, project or model, find it by name and don't ask for ids. If a name is ambiguous, list the candidates briefly.
 
@@ -1139,7 +1547,9 @@ When querying by category, query_elements defaults to instances only (scope: 'in
 
 For requests spanning multiple models (e.g. "all sheets in every model in this project"), call query_elements once per element group - always pass modelName (the name get_element_groups gave that element group), every time, not just when it seems useful - then combine_sets to merge the resulting sets into one for summarize_set/get_rows/highlight_elements. This is what keeps combined results attributable: every row carries a 'Model' column throughout, so counts, filters and exports can always be broken down or checked by model, and querying the same request again gives the same attribution rather than depending on whether you remembered to pass modelName that time. Every set query_elements or combine_sets creates also opens a browsable table in the page (below the chat) with sorting, filtering, column choice and paging over the full rows, so don't try to list many rows yourself in chat - point the user at the table instead ("I've opened set_N in the table below") and use summarize_set/get_rows only for what you need to reason about or report on directly.
 
-Viewer: render_model takes the fileVersionUrn from get_element_groups. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
+Documents (PDFs, spreadsheets and other non-Revit files in ACC Docs): list_folder without folderId gives the project's top folders; search_files finds files by extension or name through a folder and all its subfolders, and is usually faster than browsing. read_pdf attaches selected PDF pages so you can read them directly; read only the pages the question needs, since each page costs tokens, and use a first read (or the page count it reports) to locate the right pages, e.g. a sheet index, before reading more. For a drawing set, cite sheet numbers and page numbers in answers. read_spreadsheet loads one worksheet as a result set, so treat it like element data: summarize_set, filter_set and get_rows work on it, and the table below the chat shows it in full. If the header row it picked looks wrong (e.g. a title above the real headers produced "Column B"-style names), call it again with headerRow. File tools take the same projectId as get_element_groups.
+
+Viewer: render_model takes the fileVersionUrn from get_element_groups, or the versionId of a PDF/DWG from list_folder or search_files. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
 
 Property names come from the summary returned by query_elements; use them exactly. Numeric values are raw API numbers, so state units with care.
 
@@ -1173,17 +1583,29 @@ async function callClaude(messages) {
 }
 
 // Tool results from earlier turns are shortened before each request, so old
-// payloads don't keep costing tokens. The data itself stays in the result sets.
-function pruneForRequest(msgs, currentTurnStart) {
-  return msgs.map((m, i) => {
-    if (i >= currentTurnStart || m.role !== 'user' || !Array.isArray(m.content)) return m;
+// payloads don't keep costing tokens. The data itself stays in the result sets;
+// PDF pages are dropped entirely and can be read again with read_pdf.
+function pruneResult(b) {
+  if (b.type !== 'tool_result') return b;
+  if (typeof b.content === 'string') {
+    return b.content.length > 600
+      ? { ...b, content: b.content.slice(0, 600) + '\n[Earlier result shortened. Any result set it created is still available.]' }
+      : b;
+  }
+  if (Array.isArray(b.content) && b.content.some(c => c.type === 'document')) {
     return {
-      ...m,
-      content: m.content.map(b => (b.type === 'tool_result' && typeof b.content === 'string' && b.content.length > 600)
-        ? { ...b, content: b.content.slice(0, 600) + '\n[Earlier result shortened. Any result set it created is still available.]' }
-        : b)
+      ...b,
+      content: b.content.map(c => c.type === 'document'
+        ? { type: 'text', text: `[PDF pages "${c.title || 'document'}" were read earlier and removed to save tokens. Call read_pdf again if you need them.]` }
+        : c)
     };
-  });
+  }
+  return b;
+}
+function pruneForRequest(msgs, currentTurnStart) {
+  return msgs.map((m, i) => (i >= currentTurnStart || m.role !== 'user' || !Array.isArray(m.content))
+    ? m
+    : { ...m, content: m.content.map(pruneResult) });
 }
 
 async function send(text) {
@@ -1221,7 +1643,7 @@ async function send(text) {
           const impl = TOOL_IMPL[b.name];
           if (!impl) throw new Error(`Unknown tool ${b.name}`);
           const out = await impl(b.input || {});
-          results.push({ type: 'tool_result', tool_use_id: b.id, content: out.text });
+          results.push({ type: 'tool_result', tool_use_id: b.id, content: out.content || out.text });
           slip.done(out);
         } catch (e) {
           results.push({ type: 'tool_result', tool_use_id: b.id, content: `Error: ${e.message}`, is_error: true });
@@ -1338,7 +1760,9 @@ function addSlip(block) {
     done(out) {
       d.classList.remove('running');
       const sent = approxTokens(out.text.length);
-      note.textContent = out.rawChars
+      note.textContent = out.pdfPages
+        ? `${out.pdfPages} PDF page${out.pdfPages > 1 ? 's' : ''} sent to Claude (roughly ${(out.pdfPages * 1500).toLocaleString()}-${(out.pdfPages * 3000).toLocaleString()} tokens)`
+        : out.rawChars
         ? `Claude saw about ${sent.toLocaleString()} tokens of a ${approxTokens(out.rawChars).toLocaleString()}-token response`
         : `about ${sent.toLocaleString()} tokens to Claude`;
       const pre = document.createElement('pre');
@@ -1357,12 +1781,14 @@ function renderStarter() {
   const d = document.createElement('div');
   d.className = 'starter';
   d.innerHTML = `<h2>Ask about your models</h2>
-    <p>Claude reads your ACC data through the AEC Data Model API. Large query results stay in this tab, and Claude works with summaries of them.</p>`;
+    <p>Claude reads your ACC data through the AEC Data Model API, and PDFs and spreadsheets from ACC Docs. Large query results stay in this tab, and Claude works with summaries of them.</p>`;
   const prompts = [
     'List my hubs and the projects in each',
     'Open the first model in my most recent project',
     'Count the doors in this model by level, then show them in the viewer',
-    'Which walls have the largest area? Show the top ten'
+    'Which walls have the largest area? Show the top ten',
+    'Find the PDFs in Project Files and summarize the newest drawing set',
+    'Open the door schedule spreadsheet and count doors by hardware set'
   ];
   for (const p of prompts) {
     const b = document.createElement('button');
