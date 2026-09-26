@@ -536,9 +536,12 @@ async function aps(pathOrUrl) {
   let j = null;
   try { j = JSON.parse(text); } catch {}
   if (res.status === 401) throw new Error('Autodesk rejected the token (401). Sign in again.');
-  if (res.status === 403) throw new Error('Autodesk returned 403: the signed-in user has no access to this project, folder or file.');
+  if (res.status === 403) {
+    const why = j?.errors?.map(e => e.detail || e.title).join('; ') || j?.detail || j?.reason || j?.developerMessage;
+    throw new Error(`Autodesk returned 403: ${why || 'the signed-in user has no access to this project, folder or file'}.`);
+  }
   if (!res.ok || !j) {
-    const detail = j?.errors?.map(e => e.detail || e.title).join('; ') || j?.reason || j?.developerMessage || text.slice(0, 200);
+    const detail = j?.errors?.map(e => e.detail || e.title).join('; ') || j?.detail || j?.title || j?.reason || j?.developerMessage || text.slice(0, 200);
     throw new Error(`Autodesk API returned ${res.status}: ${detail}`);
   }
   return { json: j, rawChars: text.length };
@@ -712,6 +715,118 @@ function headerNames(cells, width, XLSX) {
 const cellValue = v => v instanceof Date
   ? (v.getUTCHours() || v.getUTCMinutes() || v.getUTCSeconds() ? v.toISOString().slice(0, 19).replace('T', ' ') : v.toISOString().slice(0, 10))
   : typeof v === 'string' ? v.trim() : v;
+
+/* ============================================================
+   ACC Issues (read only)
+   ============================================================ */
+// The Issues and Admin APIs take the project id without the "b." prefix.
+async function acProjectId(projectId) {
+  return (await resolveDmIds(projectId)).projectId.replace(/^b\./, '');
+}
+const issuesPath = (p, rest) => `/construction/issues/v1/projects/${encodeURIComponent(p)}${rest}`;
+
+// Offset-paginated ACC endpoints: { pagination: { totalResults }, results }.
+async function acAll(path, maxItems, pageSize = 100) {
+  const results = [];
+  let offset = 0, total = Infinity, rawChars = 0;
+  const sep = path.includes('?') ? '&' : '?';
+  while (results.length < Math.min(maxItems, total)) {
+    const { json, rawChars: n } = await aps(`${path}${sep}limit=${pageSize}&offset=${offset}`);
+    rawChars += n;
+    const page = json.results || [];
+    results.push(...page);
+    total = json.pagination?.totalResults ?? results.length;
+    if (!page.length) break;
+    offset += page.length;
+  }
+  return { results: results.slice(0, maxItems), total: Number.isFinite(total) ? total : results.length, rawChars };
+}
+
+// Types, root causes, custom fields and people are looked up once per project
+// so issues can be shown with names instead of ids.
+const issueMetaCache = new Map();
+
+async function issueMeta(projectId) {
+  const p = await acProjectId(projectId);
+  if (issueMetaCache.has(p)) return issueMetaCache.get(p);
+  const notes = [];
+  const soft = async (what, fn, fallback) => {
+    try { return await fn(); } catch (e) { notes.push(`${what} unavailable (${e.message})`); return fallback; }
+  };
+  const [types, causes, attrs, users, companies] = await Promise.all([
+    acAll(issuesPath(p, '/issue-types?include=subtypes'), 1000, 200).then(r => r.results),
+    soft('Root causes', () => acAll(issuesPath(p, '/issue-root-cause-categories?include=rootcauses'), 1000, 200).then(r => r.results), []),
+    soft('Custom attributes', () => acAll(issuesPath(p, '/issue-attribute-definitions'), 1000, 200).then(r => r.results), []),
+    soft('Project member names', () => acAll(`/construction/admin/v1/projects/${encodeURIComponent(p)}/users`, 5000, 200).then(r => r.results), []),
+    soft('Company names', () => acAll(`/construction/admin/v1/projects/${encodeURIComponent(p)}/companies`, 2000, 200).then(r => r.results), [])
+  ]);
+  const subtypes = new Map(), causeById = new Map(), attrById = new Map(), people = new Map();
+  for (const t of types) for (const st of t.subtypes || []) subtypes.set(st.id, { type: t.title, subtype: st.title, code: st.code });
+  for (const c of causes) for (const rc of c.rootCauses || []) causeById.set(rc.id, `${c.title}: ${rc.title}`);
+  for (const a of attrs) attrById.set(a.id, a);
+  for (const u of users) {
+    const name = u.name || [u.firstName, u.lastName].filter(Boolean).join(' ') || u.email;
+    if (u.autodeskId) people.set(u.autodeskId, name);
+    if (u.id) people.set(u.id, name);
+  }
+  for (const c of companies) people.set(c.id, c.name);
+  const meta = { projectId: p, types, causes, attrs, subtypes, causeById, attrById, people, notes };
+  issueMetaCache.set(p, meta);
+  return meta;
+}
+
+const ISSUE_STATUSES = ['draft', 'open', 'pending', 'in_progress', 'in_review', 'completed', 'not_approved', 'in_dispute', 'closed'];
+const personName = (meta, id) => id ? (meta.people.get(id) || id) : '';
+
+function attrValue(def, v) {
+  if (v == null || v === '') return v;
+  const options = def?.metadata?.list?.options;
+  if (!options) return v;
+  const byId = new Map(options.map(o => [o.id, o.value]));
+  return Array.isArray(v) ? v.map(x => byId.get(x) ?? x).join(', ') : (byId.get(v) ?? v);
+}
+
+// Linked file names come from the Data Management API; resolved once per file.
+const linkedNameCache = new Map();
+async function linkedFileNames(projectId, urns) {
+  const todo = [...new Set(urns)].filter(u => u && !linkedNameCache.has(u)).slice(0, 50);
+  await Promise.all(todo.map(async u => {
+    try { linkedNameCache.set(u, (await getFileVersion(projectId, u)).attributes?.displayName || u); }
+    catch { linkedNameCache.set(u, u); }
+  }));
+}
+
+function issueRow(meta, i) {
+  const st = meta.subtypes.get(i.issueSubtypeId) || {};
+  const docs = i.linkedDocuments || [];
+  const pin = docs.find(d => d.details?.externalId);
+  const props = {
+    'Display ID': i.displayId,
+    Status: i.status,
+    Type: st.type || i.issueTypeId || '',
+    Subtype: st.subtype || i.issueSubtypeId || '',
+    'Assigned To': personName(meta, i.assignedTo),
+    'Assigned To Type': i.assignedToType || '',
+    'Due Date': i.dueDate || '',
+    'Start Date': i.startDate || '',
+    Location: i.locationDetails?.location || '',
+    'Root Cause': meta.causeById.get(i.rootCauseId) || i.rootCauseId || '',
+    Created: (i.createdAt || '').slice(0, 10),
+    'Created By': personName(meta, i.createdBy),
+    Updated: (i.updatedAt || '').slice(0, 10),
+    Closed: (i.closedAt || '').slice(0, 10),
+    Published: i.published,
+    Comments: i.commentCount ?? '',
+    'Linked Files': [...new Set(docs.map(d => linkedNameCache.get(d.urn) || d.urn))].join('; '),
+    Description: i.description || '',
+    'Issue ID': i.id
+  };
+  for (const ca of i.customAttributes || []) {
+    const def = meta.attrById.get(ca.attributeDefinitionId);
+    props[def?.title || ca.title || ca.attributeDefinitionId] = attrValue(def, ca.value);
+  }
+  return { id: i.id, name: `#${i.displayId} ${i.title || ''}`.trim(), externalId: pin?.details?.externalId || null, props };
+}
 
 /* ============================================================
    Result sets: full data stays here, Claude sees summaries
@@ -1205,6 +1320,42 @@ const TOOLS = [
     }
   },
   {
+    name: 'get_issue_setup',
+    description: "Read a project's ACC Issues configuration (read only): issue types with their subtypes, root causes, and custom fields with their allowed values, plus the valid statuses. Use it to interpret or filter issues by type.",
+    input_schema: { type: 'object', properties: { projectId: { type: 'string', description: 'Project id from get_projects.' } }, required: ['projectId'] }
+  },
+  {
+    name: 'list_issues',
+    description: "Fetch ACC issues (read only) and store them as a result set: one row per issue with status, type/subtype, assignee, dates, location, root cause, linked files, description and custom fields, with names resolved where the API allows. Opens in the table below the chat; use summarize_set/filter_set/get_rows on it like any set. Issues pinned to model elements carry the element's External ID, so highlight_elements works on the set once that model is open.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        status: { type: 'array', items: { type: 'string', enum: ISSUE_STATUSES }, description: 'Only these statuses. Omit for all.' },
+        type: { type: 'string', description: 'Issue type or subtype title (from get_issue_setup), e.g. "Quality" or "Design". Case-insensitive.' },
+        assignedTo: { type: 'string', description: 'Assignee name (person or company) as shown in issues, or an id.' },
+        search: { type: 'string', description: 'Text to match in the title or display id.' },
+        dueBefore: { type: 'string', description: 'YYYY-MM-DD. Only issues due on or before this date.' },
+        dueAfter: { type: 'string', description: 'YYYY-MM-DD. Only issues due on or after this date.' },
+        linkedFileId: { type: 'string', description: 'Only issues linked to this file: itemId from list_folder/search_files.' },
+        maxIssues: { type: 'integer', description: 'Cap on issues fetched. Default 1000.' }
+      },
+      required: ['projectId']
+    }
+  },
+  {
+    name: 'get_issue',
+    description: 'Read one ACC issue in full (read only): every field, the full description, custom fields, linked files with their ids (usable with read_pdf/render_model) and pin details, and its comments.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        projectId: { type: 'string', description: 'Project id from get_projects.' },
+        issue: { type: 'string', description: "The issue's display number (e.g. 42) or its Issue ID." }
+      },
+      required: ['projectId', 'issue']
+    }
+  },
+  {
     name: 'render_model',
     description: 'Open a file in the Autodesk Viewer next to the chat: a model using the fileVersionUrn from get_element_groups, or any viewable ACC Docs file (PDF, DWG, etc.) using the versionId from list_folder or search_files.',
     input_schema: { type: 'object', properties: { fileVersionUrn: { type: 'string' } }, required: ['fileVersionUrn'] }
@@ -1510,6 +1661,97 @@ const TOOL_IMPL = {
     return { text: `${sheetsLine}\nHeaders taken from row ${h + 1}: ${names.join(' | ')}\n${describeSet(s)}` };
   },
 
+  async get_issue_setup({ projectId }) {
+    const meta = await issueMeta(projectId);
+    const parts = [];
+    parts.push(toTsvIds(['type', 'subtype', 'code', 'active', 'subtypeId'],
+      meta.types.flatMap(t => (t.subtypes || []).map(st => [t.title, st.title, st.code || '', st.isActive === false ? 'no' : 'yes', st.id]))));
+    if (meta.causes.length) parts.push('Root causes:\n' + meta.causes.map(c => `${c.title}: ${(c.rootCauses || []).map(r => r.title).join(', ')}`).join('\n'));
+    if (meta.attrs.length) parts.push('Custom fields:\n' + meta.attrs.map(a => {
+      const opts = a.metadata?.list?.options;
+      return `${a.title} (${a.dataType || 'text'})${opts ? ': ' + opts.map(o => o.value).join(', ') : ''}`;
+    }).join('\n'));
+    parts.push(`Statuses: ${ISSUE_STATUSES.join(', ')}`);
+    if (meta.notes.length) parts.push('Note: ' + meta.notes.join('; ') + '. Ids are shown where names are unavailable.');
+    return { text: parts.join('\n\n') };
+  },
+
+  async list_issues({ projectId, status, type, assignedTo, search, dueBefore, dueAfter, linkedFileId, maxIssues }) {
+    const meta = await issueMeta(projectId);
+    const cap = Math.max(1, Math.min(maxIssues || 1000, 10000));
+    const q = new URLSearchParams();
+    if (status?.length) q.set('filter[status]', status.join(','));
+    if (type) {
+      const t = String(type).toLowerCase();
+      const typeIds = meta.types.filter(x => x.title?.toLowerCase() === t).map(x => x.id);
+      const subIds = [...meta.subtypes.entries()].filter(([, v]) => v.subtype?.toLowerCase() === t).map(([id]) => id);
+      if (typeIds.length) q.set('filter[issueTypeId]', typeIds.join(','));
+      else if (subIds.length) q.set('filter[issueSubtypeId]', subIds.join(','));
+      else throw new Error(`No issue type or subtype called "${type}". Types: ${meta.types.map(x => x.title).join(', ')}.`);
+    }
+    if (assignedTo) {
+      const a = String(assignedTo).toLowerCase();
+      const ids = [...meta.people.entries()].filter(([id, name]) => id.toLowerCase() === a || String(name).toLowerCase() === a).map(([id]) => id);
+      q.set('filter[assignedTo]', (ids.length ? ids : [assignedTo]).join(','));
+    }
+    if (search) q.set('filter[search]', search);
+    if (linkedFileId) q.set('filter[linkedDocumentUrn]', linkedFileId);
+    const r = await acAll(issuesPath(meta.projectId, q.size ? `/issues?${q}` : '/issues'), cap);
+    let issues = r.results;
+    // Due-date bounds are applied here so open-ended ranges work.
+    if (dueAfter) issues = issues.filter(i => i.dueDate && i.dueDate.slice(0, 10) >= dueAfter);
+    if (dueBefore) issues = issues.filter(i => i.dueDate && i.dueDate.slice(0, 10) <= dueBefore);
+    const what = Object.entries({ status: status?.join('/'), type, assignedTo, search, dueAfter, dueBefore, linkedFileId })
+      .filter(([, v]) => v).map(([k, v]) => `${k} ${v}`).join(', ') || 'all';
+    if (!issues.length) return { text: `No issues match (${what}).`, rawChars: r.rawChars };
+    await linkedFileNames(projectId, issues.flatMap(i => (i.linkedDocuments || []).map(d => d.urn)));
+    const s = makeSet(issues.map(i => issueRow(meta, i)), {
+      source: `issues (${what})`, label: 'issues', noun: 'issues',
+      truncated: r.total > r.results.length
+    });
+    tpShow(s.id);
+    let text = describeSet(s);
+    if (meta.notes.length) text += `\nNote: ${meta.notes.join('; ')}. Ids are shown where names are unavailable.`;
+    return { text, rawChars: r.rawChars };
+  },
+
+  async get_issue({ projectId, issue }) {
+    const meta = await issueMeta(projectId);
+    const key = String(issue).replace(/^#/, '').trim();
+    let i;
+    if (/^\d+$/.test(key)) {
+      // Check the match: an unrecognised filter would otherwise return some other issue.
+      const find = async q => (await aps(issuesPath(meta.projectId, `/issues?${q}`))).json.results?.find(x => String(x.displayId) === key);
+      i = await find(`filter[displayId]=${key}&limit=10`) || await find(`filter[search]=${key}&limit=100`);
+      if (!i) throw new Error(`No issue #${key} in this project.`);
+    } else {
+      i = (await aps(issuesPath(meta.projectId, `/issues/${encodeURIComponent(key)}`))).json;
+    }
+    const docs = i.linkedDocuments || [];
+    await linkedFileNames(projectId, docs.map(d => d.urn));
+    const row = issueRow(meta, i);
+    const { Description, ...fields } = row.props;
+    const lines = [`${row.name}`, ...Object.entries(fields).filter(([, v]) => v !== '' && v != null).map(([k, v]) => `${k}: ${v}`)];
+    if (Description) lines.push('', 'Description:', Description);
+    if (docs.length) {
+      lines.push('', 'Linked files:');
+      for (const d of docs) {
+        const det = d.details || {};
+        const pin = [det.externalId && `element External ID ${det.externalId}`, det.viewable?.name && `view "${det.viewable.name}"`,
+          det.position && `at (${['x', 'y', 'z'].map(k => det.position[k]).filter(v => v != null).map(v => fmt(+v)).join(', ')})`].filter(Boolean).join(', ');
+        lines.push(`- ${linkedNameCache.get(d.urn) || d.urn} (${d.type || 'file'}; fileId ${d.urn}${d.createdAtVersion ? `; pinned on version ${d.createdAtVersion}` : ''})${pin ? ': ' + pin : ''}`);
+      }
+    }
+    try {
+      const c = await acAll(issuesPath(meta.projectId, `/issues/${encodeURIComponent(i.id)}/comments`), 50);
+      if (c.results.length) {
+        lines.push('', `Comments (${c.total}${c.total > c.results.length ? `, first ${c.results.length} shown` : ''}):`);
+        for (const cm of c.results) lines.push(`- ${(cm.createdAt || '').slice(0, 10)} ${personName(meta, cm.createdBy)}: ${String(cm.body || '').replace(/\s+/g, ' ')}`);
+      }
+    } catch (e) { lines.push('', `Comments unavailable (${e.message}).`); }
+    return { text: lines.join('\n') };
+  },
+
   async render_model({ fileVersionUrn }) {
     return { text: await renderModel(fileVersionUrn) };
   },
@@ -1537,7 +1779,7 @@ const TOOL_IMPL = {
 /* ============================================================
    Claude agent loop
    ============================================================ */
-const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revit models in ACC) and review the other files in ACC Docs (PDFs, spreadsheets) through tools, with an Autodesk Viewer shown next to the chat.
+const SYSTEM = `You help an architect explore Autodesk AEC Data Model data (Revit models in ACC) and review the other files in ACC Docs (PDFs, spreadsheets) and ACC issues through tools, with an Autodesk Viewer shown next to the chat.
 
 Navigation: get_hubs, then get_projects, then get_element_groups. If the user names a hub, project or model, find it by name and don't ask for ids. If a name is ambiguous, list the candidates briefly.
 
@@ -1548,6 +1790,8 @@ When querying by category, query_elements defaults to instances only (scope: 'in
 For requests spanning multiple models (e.g. "all sheets in every model in this project"), call query_elements once per element group - always pass modelName (the name get_element_groups gave that element group), every time, not just when it seems useful - then combine_sets to merge the resulting sets into one for summarize_set/get_rows/highlight_elements. This is what keeps combined results attributable: every row carries a 'Model' column throughout, so counts, filters and exports can always be broken down or checked by model, and querying the same request again gives the same attribution rather than depending on whether you remembered to pass modelName that time. Every set query_elements or combine_sets creates also opens a browsable table in the page (below the chat) with sorting, filtering, column choice and paging over the full rows, so don't try to list many rows yourself in chat - point the user at the table instead ("I've opened set_N in the table below") and use summarize_set/get_rows only for what you need to reason about or report on directly.
 
 Documents (PDFs, spreadsheets and other non-Revit files in ACC Docs): list_folder without folderId gives the project's top folders; search_files finds files by extension or name through a folder and all its subfolders, and is usually faster than browsing. read_pdf attaches selected PDF pages so you can read them directly; read only the pages the question needs, since each page costs tokens, and use a first read (or the page count it reports) to locate the right pages, e.g. a sheet index, before reading more. For a drawing set, cite sheet numbers and page numbers in answers. read_spreadsheet loads one worksheet as a result set, so treat it like element data: summarize_set, filter_set and get_rows work on it, and the table below the chat shows it in full. If the header row it picked looks wrong (e.g. a title above the real headers produced "Column B"-style names), call it again with headerRow. File tools take the same projectId as get_element_groups.
+
+Issues (read only - you cannot create or edit issues; if asked, say so and offer to draft the text for the user to enter in ACC): list_issues loads issues into a result set, so use summarize_set for breakdowns by Status, Type, Assigned To or Due Date and filter_set to narrow; get_issue reads one issue in full with its comments and linked files. Linked file ids work with read_pdf and render_model, so you can open the drawing or model an issue points at. Refer to issues by their display number (#42). get_issue_setup explains the project's issue types and custom fields.
 
 Viewer: render_model takes the fileVersionUrn from get_element_groups, or the versionId of a PDF/DWG from list_folder or search_files. To show elements, call highlight_elements with a setId rather than listing ids. Open the model before highlighting.
 
@@ -1781,14 +2025,15 @@ function renderStarter() {
   const d = document.createElement('div');
   d.className = 'starter';
   d.innerHTML = `<h2>Ask about your models</h2>
-    <p>Claude reads your ACC data through the AEC Data Model API, and PDFs and spreadsheets from ACC Docs. Large query results stay in this tab, and Claude works with summaries of them.</p>`;
+    <p>Claude reads your ACC data through the AEC Data Model API, PDFs and spreadsheets from ACC Docs, and ACC issues (read only). Large query results stay in this tab, and Claude works with summaries of them.</p>`;
   const prompts = [
     'List my hubs and the projects in each',
     'Open the first model in my most recent project',
     'Count the doors in this model by level, then show them in the viewer',
     'Which walls have the largest area? Show the top ten',
     'Find the PDFs in Project Files and summarize the newest drawing set',
-    'Open the door schedule spreadsheet and count doors by hardware set'
+    'Open the door schedule spreadsheet and count doors by hardware set',
+    'Summarize open issues by assignee and flag any that are overdue'
   ];
   for (const p of prompts) {
     const b = document.createElement('button');
